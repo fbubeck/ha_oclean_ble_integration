@@ -1,0 +1,250 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Oclean Toothbrush (unofficial)",
+        "description": "Set up your Oclean Smart Toothbrush. Nearby devices will be listed automatically if Bluetooth is enabled."
+      },
+      "pick_device": {
+        "title": "Select Oclean Device",
+        "description": "Select the Oclean device to integrate.",
+        "data": {
+          "mac_address": "Device",
+          "poll_interval": "Poll interval (seconds)"
+        }
+      },
+      "manual": {
+        "title": "Manual Setup",
+        "description": "No Oclean devices were found nearby. Enter the MAC address of your Oclean toothbrush manually. You can find it in the official Oclean app under device settings.",
+        "data": {
+          "mac_address": "MAC Address (e.g. AA:BB:CC:DD:EE:FF)",
+          "device_name": "Device name",
+          "poll_interval": "Poll interval (seconds)"
+        },
+        "data_description": {
+          "mac_address": "The Bluetooth MAC address of your Oclean toothbrush.",
+          "poll_interval": "How often (in seconds) to poll the device. Minimum 60 s, or 0 to disable automatic polling. Default: 300 s (5 min)."
+        }
+      },
+      "confirm": {
+        "title": "Confirm Oclean Device",
+        "description": "Found Oclean device **{name}** ({mac}). Confirm to add it.",
+        "data": {
+          "poll_interval": "Poll interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Invalid MAC address format. Please use AA:BB:CC:DD:EE:FF.",
+      "cannot_connect": "Failed to connect to the device. Make sure it is charged and nearby."
+    },
+    "abort": {
+      "already_configured": "This Oclean device is already configured.",
+      "no_devices_found": "No Oclean devices found."
+    }
+  },
+  "entity": {
+    "image": {
+      "brush_coverage": {
+        "name": "Brush Coverage"
+      },
+      "zone_heatmap": {
+        "name": "Zone Heatmap"
+      }
+    },
+    "button": {
+      "reset_brush_head": {
+        "name": "Reset Brush Head"
+      },
+      "sync_time": {
+        "name": "Sync Time"
+      },
+      "poll_now": {
+        "name": "Update Now"
+      }
+    },
+    "select": {
+      "brush_scheme": {
+        "name": "Brush Scheme"
+      }
+    },
+    "switch": {
+      "area_remind": {
+        "name": "Area Reminder"
+      },
+      "over_pressure": {
+        "name": "Over-Pressure Alert"
+      },
+      "remind_switch": {
+        "name": "Brushing Reminder"
+      },
+      "running_switch": {
+        "name": "Auto Power-Off Timer"
+      }
+    },
+    "number": {
+      "brush_head_max_days": {
+        "name": "Brush Head Max Lifetime"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Battery"
+      },
+      "last_brush_score": {
+        "name": "Score"
+      },
+      "last_brush_coverage": {
+        "name": "Coverage"
+      },
+      "last_brush_duration": {
+        "name": "Duration"
+      },
+      "last_brush_pressure": {
+        "name": "Pressure"
+      },
+      "last_brush_time": {
+        "name": "Last Session"
+      },
+      "brush_head_usage": {
+        "name": "Head Sessions"
+      },
+      "brush_head_days": {
+        "name": "Head Age"
+      },
+      "brush_mode": {
+        "name": "Mode"
+      },
+      "model_id": {
+        "name": "Model"
+      },
+      "hw_revision": {
+        "name": "HW Revision"
+      },
+      "sw_version": {
+        "name": "Firmware"
+      },
+      "last_poll": {
+        "name": "Last Poll"
+      },
+      "cleaned_zones": {
+        "name": "Cleaned Zones"
+      },
+      "last_scheme": {
+        "name": "Last Scheme"
+      },
+      "mac_address": {
+        "name": "MAC Address"
+      },
+      "duration_ratio": {
+        "name": "Duration Rating"
+      },
+      "last_brush_gesture_code": {
+        "name": "Gesture"
+      },
+      "last_brush_pressure_ratio": {
+        "name": "Pressure Detail"
+      },
+      "last_brush_power_array": {
+        "name": "Power Distribution"
+      },
+      "zone_upper_left_out": {
+        "name": "Zone Upper Left Out"
+      },
+      "zone_upper_left_in": {
+        "name": "Zone Upper Left In"
+      },
+      "zone_lower_left_out": {
+        "name": "Zone Lower Left Out"
+      },
+      "zone_lower_left_in": {
+        "name": "Zone Lower Left In"
+      },
+      "zone_upper_right_out": {
+        "name": "Zone Upper Right Out"
+      },
+      "zone_upper_right_in": {
+        "name": "Zone Upper Right In"
+      },
+      "zone_lower_right_out": {
+        "name": "Zone Lower Right Out"
+      },
+      "zone_lower_right_in": {
+        "name": "Zone Lower Right In"
+      },
+      "zone_upper_center_out": {
+        "name": "Zone Upper Center Out"
+      },
+      "zone_upper_center_in": {
+        "name": "Zone Upper Center In"
+      },
+      "zone_lower_center_out": {
+        "name": "Zone Lower Center Out"
+      },
+      "zone_lower_center_in": {
+        "name": "Zone Lower Center In"
+      },
+      "zone_history": {
+        "name": "Weakest Zone",
+        "state": {
+          "upper_left_out": "Upper Left Outside",
+          "upper_left_in": "Upper Left Inside",
+          "lower_left_out": "Lower Left Outside",
+          "lower_left_in": "Lower Left Inside",
+          "upper_right_out": "Upper Right Outside",
+          "upper_right_in": "Upper Right Inside",
+          "lower_right_out": "Lower Right Outside",
+          "lower_right_in": "Lower Right Inside"
+        }
+      },
+      "overpressure_pct": {
+        "name": "High Pressure Ratio"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Oclean Options",
+        "data": {
+          "poll_interval": "Poll interval (seconds)",
+          "post_brush_cooldown": "Post-brush cooldown (hours)",
+          "window_count": "Number of brushing time windows"
+        },
+        "data_description": {
+          "poll_interval": "How often to poll the toothbrush over Bluetooth. Minimum 60 s. Set to 0 to disable automatic polling (manual only).",
+          "post_brush_cooldown": "Pause polling for this many hours after a new brushing session is detected. Set to 0 to disable.",
+          "window_count": "Restrict polling to specific time windows (e.g. morning and evening brushing). Set to 0 to always poll."
+        }
+      },
+      "window_1": {
+        "title": "Brushing Window 1",
+        "description": "Define the first time window during which the toothbrush will be polled.",
+        "data": {
+          "window_start": "From",
+          "window_end": "To"
+        }
+      },
+      "window_2": {
+        "title": "Brushing Window 2",
+        "description": "Define the second time window during which the toothbrush will be polled.",
+        "data": {
+          "window_start": "From",
+          "window_end": "To"
+        }
+      },
+      "window_3": {
+        "title": "Brushing Window 3",
+        "description": "Define the third time window during which the toothbrush will be polled.",
+        "data": {
+          "window_start": "From",
+          "window_end": "To"
+        }
+      }
+    },
+    "error": {
+      "window_incomplete": "Both start and end time must be set.",
+      "invalid_poll_interval": "Poll interval must be 0 (manual) or at least 60 seconds."
+    }
+  }
+}

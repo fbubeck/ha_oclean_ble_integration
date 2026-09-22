@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Test artifacts
+.coverage
+htmlcov/
+
+# Oclean API token (tools/oclean_api_test.py)
+tools/.oclean_token.json
+
+# Local issue tracking
+issues/
+
+# Local Pi artifacts
+.pi/

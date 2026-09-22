@@ -1,0 +1,649 @@
+"""Sensor entities for the Oclean Toothbrush integration."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import (
+    CONF_DEVICE_NAME,
+    CONF_MAC_ADDRESS,
+    DATA_BATTERY,
+    DATA_BRUSH_HEAD_DAYS,
+    DATA_BRUSH_HEAD_USAGE,
+    DATA_BRUSH_MODE,
+    DATA_DURATION_RATIO,
+    DATA_HW_REVISION,
+    DATA_LAST_BRUSH_AREAS,
+    DATA_LAST_BRUSH_COVERAGE,
+    DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_GESTURE_ARRAY,
+    DATA_LAST_BRUSH_GESTURE_CODE,
+    DATA_LAST_BRUSH_PNUM,
+    DATA_LAST_BRUSH_POWER_ARRAY,
+    DATA_LAST_BRUSH_PRESSURE,
+    DATA_LAST_BRUSH_PRESSURE_RATIO,
+    DATA_LAST_BRUSH_SCORE,
+    DATA_LAST_BRUSH_TIME,
+    DATA_LAST_POLL,
+    DATA_MODEL_ID,
+    DATA_SW_VERSION,
+    DATA_ZONE_HISTORY,
+    DOMAIN,
+    SCHEME_NAMES,
+    TOOTH_AREA_NAMES,
+    TOOTH_AREA_NAMES_12,
+)
+from .coordinator import OcleanCoordinator
+from .entity import OcleanEntity
+
+
+def _get_areas(coordinator_data: dict | None) -> dict[str, int] | None:
+    """Return the last_brush_areas dict, or None if unavailable or wrong type."""
+    if coordinator_data is None:
+        return None
+    areas = coordinator_data.get(DATA_LAST_BRUSH_AREAS)
+    return areas if isinstance(areas, dict) else None
+
+
+# Session-derived keys: only populated from parsed brush session notifications.
+# After the first session is received (DATA_LAST_BRUSH_TIME is set), any of
+# these keys that remain None are structurally unsupported by the device protocol.
+_SESSION_DERIVED_KEYS: frozenset[str] = frozenset(
+    {
+        DATA_LAST_BRUSH_DURATION,
+        DATA_LAST_BRUSH_PRESSURE,
+        DATA_LAST_BRUSH_AREAS,
+        DATA_LAST_BRUSH_COVERAGE,
+        DATA_LAST_BRUSH_PNUM,
+        DATA_LAST_BRUSH_GESTURE_CODE,
+        DATA_LAST_BRUSH_PRESSURE_RATIO,
+        DATA_LAST_BRUSH_POWER_ARRAY,
+    }
+)
+
+# APK target brushing duration in seconds (MineReportModel: timeLongRatio = timeLong / 240.0)
+_TARGET_DURATION_S = 240
+
+
+SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key=DATA_BATTERY,
+        translation_key=DATA_BATTERY,
+        device_class=SensorDeviceClass.BATTERY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:battery",
+    ),
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_SCORE,
+        translation_key=DATA_LAST_BRUSH_SCORE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:star",
+        # 0–100 dimensionless
+    ),
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_COVERAGE,
+        translation_key=DATA_LAST_BRUSH_COVERAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:tooth",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # 0–100 %: zones with pressure > 100 (APK threshold) / 8 total zones
+    ),
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_DURATION,
+        translation_key=DATA_LAST_BRUSH_DURATION,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        suggested_unit_of_measurement=UnitOfTime.MINUTES,
+        icon="mdi:timer",
+    ),
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_PRESSURE,
+        translation_key=DATA_LAST_BRUSH_PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:gauge",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # 0–255 raw ADC value
+    ),
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_TIME,
+        translation_key=DATA_LAST_BRUSH_TIME,
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-outline",
+    ),
+    SensorEntityDescription(
+        key=DATA_BRUSH_HEAD_USAGE,
+        translation_key=DATA_BRUSH_HEAD_USAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:toothbrush",
+        # headUsedTimes from 0302 response: number of brushing sessions since last reset.
+    ),
+    SensorEntityDescription(
+        key=DATA_BRUSH_HEAD_DAYS,
+        translation_key=DATA_BRUSH_HEAD_DAYS,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="d",
+        icon="mdi:calendar-sync",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # headUsedDays from 0302 response: calendar days since last brush-head reset.
+    ),
+    # Device settings – read from 0302 device-settings response
+    SensorEntityDescription(
+        key=DATA_BRUSH_MODE,
+        translation_key=DATA_BRUSH_MODE,
+        icon="mdi:tune",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # Device information (diagnostic) – read from BLE Device Information Service (0x180A)
+    SensorEntityDescription(
+        key=DATA_MODEL_ID,
+        translation_key=DATA_MODEL_ID,
+        icon="mdi:identifier",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorEntityDescription(
+        key=DATA_HW_REVISION,
+        translation_key=DATA_HW_REVISION,
+        icon="mdi:wrench",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorEntityDescription(
+        key=DATA_SW_VERSION,
+        translation_key=DATA_SW_VERSION,
+        icon="mdi:chip",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # NOTE: MAC Address is handled by OcleanMacSensor below (needs self._mac).
+    SensorEntityDescription(
+        key=DATA_LAST_POLL,
+        translation_key=DATA_LAST_POLL,
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:clock-check-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # Gesture code: raw brushing technique indicator from BLE (APK: BrushRecordEntity.gesture)
+    SensorEntityDescription(
+        key=DATA_LAST_BRUSH_GESTURE_CODE,
+        translation_key=DATA_LAST_BRUSH_GESTURE_CODE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:hand-wave",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # 0-255 raw value from 42-byte 0307 records (byte 14)
+    ),
+    # NOTE: DATA_LAST_BRUSH_PNUM is handled by OcleanSchemeSensor below (custom class).
+    # NOTE: Duration Rating, Pressure Detail, and Power Distribution are custom sensors below.
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Oclean sensor entities."""
+    coordinator: OcleanCoordinator = hass.data[DOMAIN][entry.entry_id]
+    mac = entry.data[CONF_MAC_ADDRESS]
+    device_name = entry.data.get(CONF_DEVICE_NAME, "Oclean")
+
+    entities: list[Any] = [
+        OcleanSensor(coordinator, description, mac, device_name) for description in SENSOR_DESCRIPTIONS
+    ]
+    entities.append(OcleanBrushAreasSensor(coordinator, mac, device_name))
+    entities.append(OcleanSchemeSensor(coordinator, mac, device_name))
+    # Create zone sensors matching the device's dental cast (8 or 12).
+    # Use cached data if available, otherwise default to 8 (safe for all current devices).
+    dental_cast = (coordinator.data.get("dental_cast", 8) if coordinator.data else 8)
+    zone_names = TOOTH_AREA_NAMES_12 if dental_cast >= 12 else TOOTH_AREA_NAMES
+    entities.extend(
+        OcleanToothAreaSensor(coordinator, mac, device_name, zone_name) for zone_name in zone_names
+    )
+    entities.append(OcleanMacSensor(coordinator, mac, device_name))
+    entities.append(OcleanDurationRatingSensor(coordinator, mac, device_name))
+    entities.append(OcleanPressureDetailSensor(coordinator, mac, device_name))
+    entities.append(OcleanPowerDistributionSensor(coordinator, mac, device_name))
+    entities.append(OcleanWeakZoneSensor(coordinator, mac, device_name))
+    entities.append(OcleanOverpressureSensor(coordinator, mac, device_name))
+    async_add_entities(entities)
+
+
+class OcleanSensor(OcleanEntity, SensorEntity):
+    """A single Oclean sensor entity."""
+
+    def __init__(
+        self,
+        coordinator: OcleanCoordinator,
+        description: SensorEntityDescription,
+        mac: str,
+        device_name: str,
+    ) -> None:
+        super().__init__(coordinator, mac, device_name, description.key)
+        self.entity_description = description
+
+    @property
+    def native_value(self) -> Any:
+        """Return the sensor value, or None if not yet available."""
+        if self.coordinator.data is None:
+            return None
+        value = self.coordinator.data.get(self.entity_description.key)
+        if value is None:
+            return None
+
+        # Convert unix timestamp to datetime for timestamp sensors
+        if self.entity_description.device_class == SensorDeviceClass.TIMESTAMP:
+            try:
+                return datetime.fromtimestamp(int(value)).astimezone()
+            except (ValueError, TypeError, OSError):
+                return None
+
+        return value
+
+    @property
+    def available(self) -> bool:
+        """Return True if coordinator is available or we have stale data."""
+        data = self.coordinator.data
+        if not self.coordinator.last_update_success:
+            # Stay available if we have any cached value
+            return data is not None and data.get(self.entity_description.key) is not None
+        if self.entity_description.key not in _SESSION_DERIVED_KEYS:
+            return True
+        if data is None or data.get(DATA_LAST_BRUSH_TIME) is None:
+            return True
+        if data.get(self.entity_description.key) is not None:
+            return True
+        # Device has zone history → field is supported, just temporarily absent.
+        history = data.get(DATA_ZONE_HISTORY)
+        if isinstance(history, list) and history:
+            return True
+        return False
+
+
+class OcleanBrushAreasSensor(OcleanEntity, SensorEntity):
+    """Sensor showing how many tooth zones were cleaned in the last session.
+
+    State: number of zones (0-8) with non-zero pressure during the last session.
+    Attributes: per-zone pressure dict (zone_name → raw pressure 0-255) from the
+      extended 0308 BLE record (bytes 20-27, BrushAreaType order).
+    Zone names: upper_left_out/in, lower_left_out/in,
+                upper_right_out/in, lower_right_out/in.
+    """
+
+    _attr_translation_key = "cleaned_zones"
+    _attr_icon = "mdi:tooth-outline"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        coordinator: OcleanCoordinator,
+        mac: str,
+        device_name: str,
+    ) -> None:
+        super().__init__(coordinator, mac, device_name, DATA_LAST_BRUSH_AREAS)
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the number of zones with non-zero pressure."""
+        areas = _get_areas(self.coordinator.data)
+        if areas is None:
+            return None
+        return sum(1 for v in areas.values() if v > 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return per-zone pressure values as state attributes."""
+        return _get_areas(self.coordinator.data)
+
+    @property
+    def available(self) -> bool:
+        """Return True if coordinator is available or we have stale area data."""
+        return self._session_field_available(_get_areas(self.coordinator.data))
+
+
+class OcleanSchemeSensor(OcleanEntity, SensorEntity):
+    """Sensor showing the brush scheme (programme) used in the last session.
+
+    State: human-readable scheme name from SCHEME_NAMES, or the pNum as string
+    if the programme ID is not in the lookup table.
+    """
+
+    _attr_translation_key = "last_scheme"
+    _attr_icon = "mdi:clipboard-list"
+
+    def __init__(
+        self,
+        coordinator: OcleanCoordinator,
+        mac: str,
+        device_name: str,
+    ) -> None:
+        super().__init__(coordinator, mac, device_name, DATA_LAST_BRUSH_PNUM)
+
+    def _get_pnum(self) -> int | None:
+        if self.coordinator.data is None:
+            return None
+        value = self.coordinator.data.get(DATA_LAST_BRUSH_PNUM)
+        return int(value) if value is not None else None
+
+    @property
+    def native_value(self) -> str | None:
+        """Return scheme name, or pNum as string if not in lookup table."""
+        pnum = self._get_pnum()
+        if pnum is None:
+            return None
+        return SCHEME_NAMES.get(pnum, str(pnum))
+
+    @property
+    def available(self) -> bool:
+        """Return True if coordinator is available or we have stale pNum data."""
+        return self._session_field_available(self._get_pnum())
+
+
+class OcleanToothAreaSensor(OcleanEntity, SensorEntity):
+    """Individual sensor for one tooth-zone pressure value from the last session.
+
+    One instance is created per entry in TOOTH_AREA_NAMES (8 total).
+    State: raw pressure value 0-255 for that zone (0 = not cleaned / no data).
+    Source: last_brush_areas dict populated from 2604 BLE notifications.
+    """
+
+    _attr_icon = "mdi:tooth"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: OcleanCoordinator,
+        mac: str,
+        device_name: str,
+        zone_name: str,
+    ) -> None:
+        super().__init__(coordinator, mac, device_name, f"tooth_area_{zone_name}")
+        self._zone_name = zone_name
+        self._attr_translation_key = f"zone_{zone_name}"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the pressure value for this zone, or None if unavailable."""
+        areas = _get_areas(self.coordinator.data)
+        if areas is None:
+            return None
+        return areas.get(self._zone_name)
+
+    @property
+    def available(self) -> bool:
+        """Return True if coordinator is available or we have stale area data."""
+        return self._session_field_available(_get_areas(self.coordinator.data))
+
+
+class OcleanDurationRatingSensor(OcleanEntity, SensorEntity):
+    """Sensor showing how well the target brushing duration (240 s) was met.
+
+    State: percentage 0-100 (capped), calculated as round(duration / 240 * 100).
+    Source: APK MineReportModel.java — timeLongRatio = timeLong / 240.0.
+    """
+
+    _attr_translation_key = DATA_DURATION_RATIO
+    _attr_icon = "mdi:timer-check"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, DATA_DURATION_RATIO)
+
+    @property
+    def native_value(self) -> int | None:
+        if self.coordinator.data is None:
+            return None
+        duration = self.coordinator.data.get(DATA_LAST_BRUSH_DURATION)
+        if duration is None:
+            return None
+        return min(100, round(int(duration) / _TARGET_DURATION_S * 100))
+
+    @property
+    def available(self) -> bool:
+        if self.coordinator.data is None:
+            return False
+        return self._session_field_available(self.coordinator.data.get(DATA_LAST_BRUSH_DURATION))
+
+
+class OcleanPressureDetailSensor(OcleanEntity, SensorEntity):
+    """Sensor exposing the 5-segment pressure ratio from 42-byte session records.
+
+    State: average of the 5 pressure-ratio values.
+    Attributes: per-segment values (segment_1 through segment_5).
+    Source: APK BrushRecordEntity.pressureRatio — bytes 11-15 of 0307 record.
+    """
+
+    _attr_translation_key = DATA_LAST_BRUSH_PRESSURE_RATIO
+    _attr_icon = "mdi:gauge-low"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, DATA_LAST_BRUSH_PRESSURE_RATIO)
+
+    def _get_ratio(self) -> list[int] | None:
+        if self.coordinator.data is None:
+            return None
+        value = self.coordinator.data.get(DATA_LAST_BRUSH_PRESSURE_RATIO)
+        return value if isinstance(value, list) and len(value) == 5 else None
+
+    @property
+    def native_value(self) -> int | None:
+        ratio = self._get_ratio()
+        if ratio is None:
+            return None
+        return round(sum(ratio) / len(ratio))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        ratio = self._get_ratio()
+        if ratio is None:
+            return None
+        return {f"segment_{i + 1}": v for i, v in enumerate(ratio)}
+
+    @property
+    def available(self) -> bool:
+        return self._session_field_available(self._get_ratio())
+
+
+class OcleanPowerDistributionSensor(OcleanEntity, SensorEntity):
+    """Sensor exposing per-zone power levels (0-3) from 42-byte session records.
+
+    State: number of zones with power > 0.
+    Attributes: per-zone power values using TOOTH_AREA_NAMES, plus gesture_array.
+    Source: APK BrushRecordEntity.gesture / powerArray — nibbles from bytes 30-32.
+    """
+
+    _attr_translation_key = DATA_LAST_BRUSH_POWER_ARRAY
+    _attr_icon = "mdi:flash"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, DATA_LAST_BRUSH_POWER_ARRAY)
+
+    def _get_power(self) -> list[int] | None:
+        if self.coordinator.data is None:
+            return None
+        value = self.coordinator.data.get(DATA_LAST_BRUSH_POWER_ARRAY)
+        return value if isinstance(value, list) else None
+
+    @property
+    def native_value(self) -> int | None:
+        power = self._get_power()
+        if power is None:
+            return None
+        return sum(1 for v in power if v > 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        data = self.coordinator.data
+        if data is None:
+            return None
+        attrs: dict[str, Any] = {}
+        power = self._get_power()
+        if power is not None:
+            # Map first 8 values to zone names, remaining as indexed
+            for i, v in enumerate(power):
+                if i < len(TOOTH_AREA_NAMES):
+                    attrs[TOOTH_AREA_NAMES[i]] = v
+                else:
+                    attrs[f"zone_{i + 1}"] = v
+        gesture_array = data.get(DATA_LAST_BRUSH_GESTURE_ARRAY)
+        if isinstance(gesture_array, list):
+            attrs["gesture_array"] = gesture_array
+        return attrs if attrs else None
+
+    @property
+    def available(self) -> bool:
+        return self._session_field_available(self._get_power())
+
+
+class OcleanMacSensor(OcleanEntity, SensorEntity):
+    """Diagnostic sensor exposing the device Bluetooth MAC address."""
+
+    _attr_translation_key = "mac_address"
+    _attr_icon = "mdi:bluetooth"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "mac_address")
+
+    @property
+    def native_value(self) -> str:
+        return self._mac
+
+    @property
+    def available(self) -> bool:
+        return True
+
+
+# Minimum sessions required before the weak-zone sensor reports a value.
+# With fewer sessions the average is too noisy to be meaningful.
+_WEAK_ZONE_MIN_SESSIONS = 2
+
+
+class OcleanWeakZoneSensor(OcleanEntity, SensorEntity):
+    """Sensor identifying the chronically weakest brushed zone.
+
+    State: internal zone name of the zone with the lowest average pressure
+    across the last ZONE_HISTORY_MAX_SESSIONS sessions (e.g. 'lower_right_out').
+    Requires at least 2 sessions with area data before reporting a value.
+
+    Attributes:
+        zone_averages   – average pressure per zone (rounded to 1 decimal)
+        sessions_count  – number of sessions used for the calculation
+    """
+
+    _attr_translation_key = DATA_ZONE_HISTORY
+    _attr_icon = "mdi:tooth-outline"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "weak_zone")
+
+    def _zone_averages(self) -> dict[str, float] | None:
+        data = self.coordinator.data
+        if data is None:
+            return None
+        history = data.get(DATA_ZONE_HISTORY)
+        if not history or len(history) < _WEAK_ZONE_MIN_SESSIONS:
+            return None
+        zone_names = list(history[0].keys())
+        return {
+            name: round(sum(s.get(name, 0) for s in history) / len(history), 1)
+            for name in zone_names
+        }
+
+    @property
+    def native_value(self) -> str | None:
+        avgs = self._zone_averages()
+        if not avgs:
+            return None
+        return min(avgs, key=lambda z: avgs[z])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        avgs = self._zone_averages()
+        if not avgs:
+            return None
+        data = self.coordinator.data
+        history = data.get(DATA_ZONE_HISTORY) if data else []
+        return {
+            **avgs,
+            "sessions_count": len(history) if history else 0,
+        }
+
+    @property
+    def available(self) -> bool:
+        avgs = self._zone_averages()
+        return avgs is not None
+
+
+class OcleanOverpressureSensor(OcleanEntity, SensorEntity):
+    """Sensor showing the percentage of brushing time spent at high pressure.
+
+    Derived from the pressure_ratio field (bytes 11-15 of the 42-byte session
+    record).  Each value counts 5-second intervals at one of 5 pressure levels
+    (sum ≈ 36 = 180 s / 5 s).  Levels 4 and 5 (indices 3 and 4) represent heavy
+    and very-heavy pressure respectively; their share of the total is reported as
+    the overpressure percentage.
+
+    Only available for TYPE1 devices (OCLEANY3P, OCLEANY3M, OCLEANY3) that
+    include the pressure_ratio bytes in their session records.
+    """
+
+    _attr_translation_key = "overpressure_pct"
+    _attr_icon = "mdi:gauge-full"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: OcleanCoordinator, mac: str, device_name: str) -> None:
+        super().__init__(coordinator, mac, device_name, "overpressure_pct")
+
+    def _get_ratio(self) -> list[int] | None:
+        if self.coordinator.data is None:
+            return None
+        value = self.coordinator.data.get(DATA_LAST_BRUSH_PRESSURE_RATIO)
+        return value if isinstance(value, list) and len(value) >= 5 else None
+
+    @property
+    def native_value(self) -> int | None:
+        ratio = self._get_ratio()
+        if ratio is None:
+            return None
+        total = sum(ratio)
+        if total == 0:
+            return 0
+        return round((ratio[3] + ratio[4]) / total * 100)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        ratio = self._get_ratio()
+        if ratio is None:
+            return None
+        return {
+            "level_1": ratio[0],
+            "level_2": ratio[1],
+            "level_3": ratio[2],
+            "level_4_heavy": ratio[3],
+            "level_5_very_heavy": ratio[4],
+        }
+
+    @property
+    def available(self) -> bool:
+        return self._session_field_available(self._get_ratio())

@@ -1,0 +1,250 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Oclean Zahnbürste (inoffiziell)",
+        "description": "Oclean Smart Toothbrush einrichten. Wenn Bluetooth aktiviert ist, werden Geräte in der Nähe automatisch gefunden."
+      },
+      "pick_device": {
+        "title": "Oclean-Gerät auswählen",
+        "description": "Wähle das Oclean-Gerät aus, das integriert werden soll.",
+        "data": {
+          "mac_address": "Gerät",
+          "poll_interval": "Abfrageintervall (Sekunden)"
+        }
+      },
+      "manual": {
+        "title": "Manuelle Einrichtung",
+        "description": "Es wurden keine Oclean-Geräte in der Nähe gefunden. Gib die MAC-Adresse deiner Oclean-Zahnbürste manuell ein. Du findest sie in der offiziellen Oclean-App unter den Geräteeinstellungen.",
+        "data": {
+          "mac_address": "MAC-Adresse (z. B. AA:BB:CC:DD:EE:FF)",
+          "device_name": "Gerätename",
+          "poll_interval": "Abfrageintervall (Sekunden)"
+        },
+        "data_description": {
+          "mac_address": "Die Bluetooth-MAC-Adresse deiner Oclean-Zahnbürste.",
+          "poll_interval": "Wie oft (in Sekunden) das Gerät abgefragt werden soll. Minimum: 60 s, oder 0 zum Deaktivieren des automatischen Pollings. Standard: 300 s (5 min)."
+        }
+      },
+      "confirm": {
+        "title": "Oclean-Gerät bestätigen",
+        "description": "Oclean-Gerät **{name}** ({mac}) gefunden. Bestätigen, um es hinzuzufügen.",
+        "data": {
+          "poll_interval": "Abfrageintervall (Sekunden)"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Ungültiges MAC-Adress-Format. Bitte AA:BB:CC:DD:EE:FF verwenden.",
+      "cannot_connect": "Verbindung zum Gerät fehlgeschlagen. Bitte sicherstellen, dass es geladen und in Reichweite ist."
+    },
+    "abort": {
+      "already_configured": "Dieses Oclean-Gerät ist bereits eingerichtet.",
+      "no_devices_found": "Keine Oclean-Geräte gefunden."
+    }
+  },
+  "entity": {
+    "image": {
+      "brush_coverage": {
+        "name": "Putzabdeckung"
+      },
+      "zone_heatmap": {
+        "name": "Zonen-Heatmap"
+      }
+    },
+    "button": {
+      "reset_brush_head": {
+        "name": "Bürstenkopf zurücksetzen"
+      },
+      "sync_time": {
+        "name": "Zeit synchronisieren"
+      },
+      "poll_now": {
+        "name": "Jetzt aktualisieren"
+      }
+    },
+    "select": {
+      "brush_scheme": {
+        "name": "Putzprogramm"
+      }
+    },
+    "switch": {
+      "area_remind": {
+        "name": "Zahnbereichs-Erinnerung"
+      },
+      "over_pressure": {
+        "name": "Überdruck-Warnung"
+      },
+      "remind_switch": {
+        "name": "Putz-Erinnerung"
+      },
+      "running_switch": {
+        "name": "Auto-Abschaltung"
+      }
+    },
+    "number": {
+      "brush_head_max_days": {
+        "name": "Max. Bürstenkopf-Laufzeit"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Akku"
+      },
+      "last_brush_score": {
+        "name": "Score"
+      },
+      "last_brush_coverage": {
+        "name": "Abdeckung"
+      },
+      "last_brush_duration": {
+        "name": "Dauer"
+      },
+      "last_brush_pressure": {
+        "name": "Druck"
+      },
+      "last_brush_time": {
+        "name": "Letzte Sitzung"
+      },
+      "brush_head_usage": {
+        "name": "Kopf-Sitzungen"
+      },
+      "brush_head_days": {
+        "name": "Kopf-Alter"
+      },
+      "brush_mode": {
+        "name": "Modus"
+      },
+      "model_id": {
+        "name": "Modell"
+      },
+      "hw_revision": {
+        "name": "HW-Revision"
+      },
+      "sw_version": {
+        "name": "Firmware"
+      },
+      "last_poll": {
+        "name": "Letzte Abfrage"
+      },
+      "cleaned_zones": {
+        "name": "Gereinigte Zonen"
+      },
+      "last_scheme": {
+        "name": "Letztes Programm"
+      },
+      "mac_address": {
+        "name": "MAC-Adresse"
+      },
+      "duration_ratio": {
+        "name": "Dauer-Bewertung"
+      },
+      "last_brush_gesture_code": {
+        "name": "Putztechnik"
+      },
+      "last_brush_pressure_ratio": {
+        "name": "Druckverteilung"
+      },
+      "last_brush_power_array": {
+        "name": "Leistungsverteilung"
+      },
+      "zone_upper_left_out": {
+        "name": "Zone Oben Links Außen"
+      },
+      "zone_upper_left_in": {
+        "name": "Zone Oben Links Innen"
+      },
+      "zone_lower_left_out": {
+        "name": "Zone Unten Links Außen"
+      },
+      "zone_lower_left_in": {
+        "name": "Zone Unten Links Innen"
+      },
+      "zone_upper_right_out": {
+        "name": "Zone Oben Rechts Außen"
+      },
+      "zone_upper_right_in": {
+        "name": "Zone Oben Rechts Innen"
+      },
+      "zone_lower_right_out": {
+        "name": "Zone Unten Rechts Außen"
+      },
+      "zone_lower_right_in": {
+        "name": "Zone Unten Rechts Innen"
+      },
+      "zone_upper_center_out": {
+        "name": "Zone Oben Mitte Außen"
+      },
+      "zone_upper_center_in": {
+        "name": "Zone Oben Mitte Innen"
+      },
+      "zone_lower_center_out": {
+        "name": "Zone Unten Mitte Außen"
+      },
+      "zone_lower_center_in": {
+        "name": "Zone Unten Mitte Innen"
+      },
+      "zone_history": {
+        "name": "Schwächste Zone",
+        "state": {
+          "upper_left_out": "Oben Links Außen",
+          "upper_left_in": "Oben Links Innen",
+          "lower_left_out": "Unten Links Außen",
+          "lower_left_in": "Unten Links Innen",
+          "upper_right_out": "Oben Rechts Außen",
+          "upper_right_in": "Oben Rechts Innen",
+          "lower_right_out": "Unten Rechts Außen",
+          "lower_right_in": "Unten Rechts Innen"
+        }
+      },
+      "overpressure_pct": {
+        "name": "Anteil Überdruck"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Oclean-Optionen",
+        "data": {
+          "poll_interval": "Abfrageintervall (Sekunden)",
+          "post_brush_cooldown": "Cooldown nach dem Putzen (Stunden)",
+          "window_count": "Anzahl der Zahnputz-Zeitfenster"
+        },
+        "data_description": {
+          "poll_interval": "Wie oft die Zahnbürste per Bluetooth abgefragt werden soll. Minimum: 60 s. 0 = manuell (kein automatisches Polling).",
+          "post_brush_cooldown": "Abfragen für diese Anzahl Stunden pausieren, nachdem eine neue Putzsitzung erkannt wurde. 0 = deaktiviert.",
+          "window_count": "Abfrage auf bestimmte Zeitfenster beschränken (z. B. morgens und abends beim Zähneputzen). 0 = immer abfragen."
+        }
+      },
+      "window_1": {
+        "title": "Zahnputz-Zeitfenster 1",
+        "description": "Erstes Zeitfenster definieren, in dem die Zahnbürste abgefragt wird.",
+        "data": {
+          "window_start": "Von",
+          "window_end": "Bis"
+        }
+      },
+      "window_2": {
+        "title": "Zahnputz-Zeitfenster 2",
+        "description": "Zweites Zeitfenster definieren, in dem die Zahnbürste abgefragt wird.",
+        "data": {
+          "window_start": "Von",
+          "window_end": "Bis"
+        }
+      },
+      "window_3": {
+        "title": "Zahnputz-Zeitfenster 3",
+        "description": "Drittes Zeitfenster definieren, in dem die Zahnbürste abgefragt wird.",
+        "data": {
+          "window_start": "Von",
+          "window_end": "Bis"
+        }
+      }
+    },
+    "error": {
+      "window_incomplete": "Von- und Bis-Zeit müssen beide gesetzt sein.",
+      "invalid_poll_interval": "Abfrageintervall muss 0 (manuell) oder mindestens 60 Sekunden sein."
+    }
+  }
+}

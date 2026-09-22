@@ -1,0 +1,360 @@
+"""Constants for the Oclean Toothbrush integration."""
+
+DOMAIN = "oclean_ble"
+MANUFACTURER = "Oclean"
+
+# Default polling interval in seconds
+DEFAULT_POLL_INTERVAL = 300  # 5 minutes
+MIN_POLL_INTERVAL = 60  # 1 minute
+POLL_INTERVAL_MANUAL = 0  # sentinel: disable automatic polling; only poll on-demand
+
+# Service names
+SERVICE_POLL = "poll"
+
+# BLE UUIDs
+OCLEAN_SERVICE_UUID = "8082caa8-41a6-4021-91c6-56f9b954cc18"
+
+# BLE Device Information Service (0x180A) – standard GATT service
+DIS_MODEL_UUID = "00002a24-0000-1000-8000-00805f9b34fb"  # Model Number String
+DIS_HW_REV_UUID = "00002a27-0000-1000-8000-00805f9b34fb"  # Hardware Revision String
+DIS_SW_REV_UUID = "00002a28-0000-1000-8000-00805f9b34fb"  # Software Revision String
+BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_CHAR_UUID = "00002a19-0000-1000-8000-00805f9b34fb"  # Read, Notify
+READ_NOTIFY_CHAR_UUID = "5f78df94-798c-46f5-990a-855b673fbb86"  # Notify (all types)
+WRITE_CHAR_UUID = "9d84b9a3-000c-49d8-9183-855b673fbb85"  # Write (all types)
+SEND_BRUSH_CMD_UUID = "5f78df94-798c-46f5-990a-855b673fbb89"  # Write (Type 1 running-data cmd)
+RECEIVE_BRUSH_UUID = "5f78df94-798c-46f5-990a-855b673fbb90"  # Notify (Type 1 brush records)
+CHANGE_INFO_UUID = "6c290d2e-1c03-aca1-ab48-a9b908bae79e"  # Notify (Type 0 only)
+
+# BLE Commands (hex bytes)
+# Source: C3335a.java / C3340b1.java
+CMD_QUERY_STATUS = bytes.fromhex("0303")  # mo5295Q0 – all types
+CMD_DEVICE_INFO = bytes.fromhex("0202")  # mo5310r0 – all types
+CMD_CALIBRATE_TIME_PREFIX = bytes.fromhex("020E")  # mo5289B Type 0: + 4-byte BE unix timestamp
+CMD_CALIBRATE_TIME_T1_PREFIX = bytes.fromhex("0201")  # mo5292L Type 1 (C3352g): + 8-byte datetime payload
+CMD_QUERY_RUNNING_DATA = bytes.fromhex("0308")  # mo5299S0 Type 0 / C3340b1 – fetch brush records
+CMD_QUERY_RUNNING_DATA_T1 = bytes.fromhex("0307")  # Type 1 (Oclean X): send to SEND_BRUSH_CMD_UUID
+CMD_QUERY_RUNNING_DATA_NEXT = bytes.fromhex("0309")  # mo5301W0 – follow-up page
+CMD_QUERY_EXTENDED_DATA_T1 = bytes.fromhex("0314")  # mo5337g1 – C3376s (Oclean X Pro); extended session data
+CMD_QUERY_DEVICE_SETTINGS = bytes.fromhex(
+    "030201"
+)  # mo5301W0 / W0 – request device settings (modeNum, areaRemind, brush head counters, etc.)
+
+# Response type markers (first 2 bytes)
+# Observed on Oclean X: the device echoes the command prefix as the response type.
+# CMD_QUERY_STATUS (0303) → response starts with 0303
+# CMD_QUERY_RUNNING_DATA (0308) → response starts with 0308
+# CMD_DEVICE_INFO (0202) → response is "0202 4F 4B" (= "OK", just an ACK)
+RESP_STATE = bytes.fromhex("0303")  # Response to CMD_QUERY_STATUS – device status
+RESP_DEVICE_SETTINGS = bytes.fromhex("0302")  # Device-Info notification – settings + brush head counters
+RESP_INFO = bytes.fromhex("0308")  # Response to CMD_QUERY_RUNNING_DATA – brush records (Type 0)
+RESP_INFO_T1 = bytes.fromhex("0307")  # Response to CMD_QUERY_RUNNING_DATA_T1 – brush records (Type 1, Oclean X)
+RESP_DEVICE_INFO = bytes.fromhex("0202")  # Response to CMD_DEVICE_INFO – "OK" acknowledge
+RESP_DEVICE_SETTINGS = bytes.fromhex("0302")  # Response to CMD_QUERY_DEVICE_SETTINGS – device settings payload
+RESP_K3GUIDE = bytes.fromhex("0340")  # Real-time zone guidance during brushing (K3 devices)
+RESP_EXTENDED_T1 = bytes.fromhex("0314")  # Response to CMD_QUERY_EXTENDED_DATA_T1 (score candidate)
+RESP_SCORE_T1 = bytes.fromhex("0000")  # Score push (Type-1, Oclean X series): payload[0] = score 0-100
+RESP_SESSION_META_T1 = bytes.fromhex("5a00")  # Session metadata push (Type-1): date/time + duration
+RESP_BRUSH_AREAS_T1 = bytes.fromhex("2604")  # Per-tooth-area pressure data (Type-1)
+RESP_UNKNOWN_5400 = bytes.fromhex(
+    "5400"
+)  # Unknown push (Type-1, Oclean X); not in APK – empirical analysis in progress
+# OCLEANY3P-specific notification types (observed 2026-02-24, sw=1.0.0.41)
+# Sent by device in response to CMD_QUERY_RUNNING_DATA_T1 (0307) on SEND_BRUSH_CMD_UUID.
+# Analogous to 2604 (area pressures) and 5a00 (session meta) on OCLEANY3M.
+# Byte layout confirmed from log analysis (2026-03-07) against APK C3352g fallback.
+RESP_BRUSH_AREAS_Y3P = bytes.fromhex("021f")  # Zone/area pressure data for OCLEANY3P (analog to 2604)
+RESP_SESSION_META_Y3P = bytes.fromhex("5100")  # Session metadata for OCLEANY3P (analog to 5a00)
+# OCLEANY3MH-specific notification types (observed 2026-03-10, issue #19).
+# Format not yet confirmed; logged verbosely for research.
+RESP_UNKNOWN_4B00 = bytes.fromhex("4b00")  # Unknown push on OCLEANY3MH; may be session index/list
+# Note: 0x3A03 is NOT registered here because byte 0 appears to vary with the
+# brushing score (0x3a = 58 in one observed session). The unknown-notification
+# fallback in parser.py detects this pattern and logs it verbosely.
+
+# Config entry keys
+CONF_MAC_ADDRESS = "mac_address"
+CONF_POLL_INTERVAL = "poll_interval"
+CONF_DEVICE_NAME = "device_name"
+CONF_POLL_WINDOWS = "poll_windows"  # str: "HH:MM-HH:MM[, HH:MM-HH:MM, ...]", "" = disabled
+CONF_POST_BRUSH_COOLDOWN = "post_brush_cooldown"  # int hours, 0 = disabled
+
+# Options-flow fields for the multi-step window setup (not persisted; combined into CONF_POLL_WINDOWS).
+CONF_WINDOW_COUNT = "window_count"  # int 0-3: how many poll windows the user wants
+CONF_WINDOW_START = "window_start"  # str "HH:MM:SS": start time in a per-window step
+CONF_WINDOW_END = "window_end"  # str "HH:MM:SS": end time in a per-window step
+DEFAULT_POST_BRUSH_COOLDOWN = 0
+
+# Coordinator data keys
+DATA_BATTERY = "battery"
+DATA_LAST_BRUSH_SCORE = "last_brush_score"
+DATA_LAST_BRUSH_DURATION = "last_brush_duration"
+DATA_LAST_BRUSH_PRESSURE = "last_brush_pressure"
+DATA_LAST_BRUSH_TIME = "last_brush_time"
+
+# BLE connection timeout in seconds
+BLE_CONNECT_TIMEOUT = 10
+# Post-connect pause before issuing GATT commands (proxy backend needs time to
+# finish processing the GATT service table after establish_connection returns).
+BLE_POST_CONNECT_DELAY = 2.0
+# Time to wait for the first session notification after sending a query command.
+# Must be long enough for the full *B# stream to arrive via an ESPHome BLE proxy:
+# observed rate ~437 B/s → 32 sessions × 42 B = 1 344 B ≈ 3.1 s; 60 sessions ≈ 5.8 s.
+# 8 s gives comfortable headroom for large session counts and slow proxy setups.
+BLE_NOTIFICATION_WAIT = 8
+# Extra wait after receiving a session, allowing the device time to push
+# enrichment notifications (0000 score, 2604 zone pressures).  These are
+# unsolicited pushes the device sends shortly after the 0307 session response.
+BLE_ENRICHMENT_WAIT = 1.5
+# Wait before READ fallback poll for devices without CCCD (e.g. OCLEANA1).
+BLE_READ_FALLBACK_DELAY = 1.5
+# Per-page notification timeout used during 0309 session pagination.
+BLE_PAGINATION_TIMEOUT = 2.0
+# Timeout for the first start_notify() attempt.  Short so that a TimeoutError
+# (e.g. stale CCCD from a crashed connection) triggers the CCCD-clear retry
+# quickly instead of wasting 10 s per characteristic.
+BLE_SUBSCRIBE_FIRST_TIMEOUT = 3.0
+# Timeout for the retry attempt after a CCCD clear.  Longer because the device
+# may need a moment to process the CCCD write before re-subscribing.
+BLE_SUBSCRIBE_RETRY_TIMEOUT = 5.0
+# Maximum total time for a single poll (connect → read → disconnect).
+# Prevents a hung GATT operation from blocking HA's event loop indefinitely.
+BLE_POLL_TOTAL_TIMEOUT = 60
+# Timeout for a single write_gatt_char() call in the polling path.
+# Guards against BlueZ or ESPHome proxy hangs on individual write operations.
+BLE_WRITE_TIMEOUT = 5.0
+# Polling fallback: when notification subscriptions fail persistently (e.g. BlueZ
+# "Notify acquired"), read the response characteristic in a loop instead.
+BLE_POLL_FALLBACK_ATTEMPTS = 6
+BLE_POLL_FALLBACK_INTERVAL = 1.0
+# Shortened notification wait when no notify chars could be subscribed.
+# Just enough for the device to process commands before polling starts.
+BLE_NOTIFICATION_WAIT_NO_SUB = 2.0
+
+# Brush head reset command
+CMD_CLEAR_BRUSH_HEAD = bytes.fromhex("020F")
+# Brush scheme set command (TYPE1 devices: OCLEANY3M family)
+# Source: C3385w0.java / AbstractC0002b.m28p() — command array {"0206", "020B"}
+CMD_SET_BRUSH_SCHEME = bytes.fromhex("0206")  # packet 1 header
+CMD_SET_BRUSH_SCHEME_CONT = bytes.fromhex("020B")  # packet 2 header (MTU split only)
+# Area reminder command (mo5298S, OcleanBleManager.setAreaRemind)
+CMD_AREA_REMIND = bytes.fromhex("020D")  # + 0x01 (on) / 0x00 (off)
+# Over-pressure alert command (C3376s.G0, OcleanBleManager.setOverPressure)
+CMD_OVER_PRESSURE = bytes.fromhex("0212")  # + 0x01 (on) / 0x00 (off)
+# Remind switch command (C3335a.mo5297R0, OcleanBleManager.setRemindSwitch)
+CMD_REMIND_SWITCH = bytes.fromhex("0239")  # + 0x01 (on) / 0x00 (off)
+# Running switch command (C3335a.mo5300T0, OcleanBleManager.setRunningSwitch)
+CMD_RUNNING_SWITCH = bytes.fromhex("0240")  # + 0x01 (on) / 0x00 (off)
+# Brush head max lifetime command (mo5345x, OcleanBleManager.setRunningHeadMaxTime)
+CMD_BRUSH_HEAD_MAX_DAYS = bytes.fromhex("0217")  # + 2-byte big-endian uint16 (days)
+
+# Coordinator data keys (additional)
+DATA_BRUSH_HEAD_USAGE = "brush_head_usage"
+DATA_BRUSH_HEAD_DAYS = "brush_head_days"
+DATA_MODEL_ID = "model_id"  # Model Number from BLE DIS (e.g. "OCLEANY3M")
+DATA_HW_REVISION = "hw_revision"  # Hardware Revision from BLE DIS (e.g. "Rev.D")
+DATA_SW_VERSION = "sw_version"  # Software Revision from BLE DIS (e.g. "1.0.0.20")
+DATA_LAST_BRUSH_AREAS = "last_brush_areas"  # dict: zone_name → pressure (0-255)
+DATA_LAST_BRUSH_COVERAGE = "last_brush_coverage"  # int 0-100: percentage of zones adequately cleaned
+DATA_LAST_BRUSH_PNUM = "last_brush_pnum"  # int (brush-scheme ID; see SCHEME_NAMES below)
+DATA_LAST_BRUSH_GESTURE_CODE = "last_brush_gesture_code"  # int 0-255 (APK: byte 14)
+DATA_LAST_BRUSH_PRESSURE_RATIO = "last_brush_pressure_ratio"  # list[int] len=5 (bytes 11-15)
+DATA_LAST_BRUSH_GESTURE_ARRAY = "last_brush_gesture_array"  # list[int] len=13 (bytes 18-30)
+DATA_LAST_BRUSH_POWER_ARRAY = "last_brush_power_array"  # list[int] len=12, each 0-3 (nibbles from bytes 30-32)
+DATA_BRUSH_MODE = "brush_mode"  # int: active brushing mode number from 0302 device-settings response (byte 5)
+DATA_LAST_POLL = "last_poll"  # Unix timestamp (seconds) of the last successful BLE poll
+DATA_DENTAL_CAST = "dental_cast"  # int: number of tooth zones (8 or 12)
+DATA_DURATION_RATIO = "duration_ratio"  # int 0-100+: duration/240*100 (APK: MineReportModel.timeLongRatio)
+DATA_ZONE_HISTORY = "zone_history"  # list[dict[str, int]]: per-zone pressures for the last N sessions
+
+# Rolling zone history: number of sessions retained for weak-zone analysis and heatmap
+ZONE_HISTORY_MAX_SESSIONS = 30
+
+# Coverage calculation threshold (APK: C2928q.java — raw_pressure * 4 > 400 → pressure > 100)
+COVERAGE_PRESSURE_THRESHOLD = 100
+
+# Tooth area zone names in BrushAreaType enum order (value 1 → index 0 … value 8 → index 7)
+# Source: com/ocleanble/lib/device/BrushAreaType.java
+TOOTH_AREA_NAMES: tuple[str, ...] = (
+    "upper_left_out",  # AREA_LIFT_UP_OUT    (value 1)
+    "upper_left_in",  # AREA_LIFT_UP_IN     (value 2)
+    "lower_left_out",  # AREA_LIFT_DOWN_OUT  (value 3)
+    "lower_left_in",  # AREA_LIFT_DOWN_IN   (value 4)
+    "upper_right_out",  # AREA_RIGHT_UP_OUT   (value 5)
+    "upper_right_in",  # AREA_RIGHT_UP_IN    (value 6)
+    "lower_right_out",  # AREA_RIGHT_DOWN_OUT (value 7)
+    "lower_right_in",  # AREA_RIGHT_DOWN_IN  (value 8)
+)
+
+# 12-zone layout for YD-series devices (YD000C/D/F/10).
+# Adds center zones between left and right for each jaw half.
+# Source: DentalCastRegionNewView.java, dental_cast12_* assets.
+TOOTH_AREA_NAMES_12: tuple[str, ...] = (
+    "upper_left_out",
+    "upper_left_in",
+    "upper_center_out",
+    "upper_center_in",
+    "upper_right_out",
+    "upper_right_in",
+    "lower_left_out",
+    "lower_left_in",
+    "lower_center_out",
+    "lower_center_in",
+    "lower_right_out",
+    "lower_right_in",
+)
+
+
+def area_names_for_count(zone_count: int) -> tuple[str, ...]:
+    """Return the zone-name tuple matching the given zone count (8 or 12)."""
+    if zone_count >= 12:
+        return TOOTH_AREA_NAMES_12
+    return TOOTH_AREA_NAMES
+
+
+# Brush scheme name lookup: pNum → English display name.
+# Source: GET /Romap/v1/DeviceContoller/GetAllResources (language=en), fetched 2026-02-22.
+# Notes:
+#   - pNum is device-family-specific; same integer can mean different schemes on different models.
+#   - pNums 0-2 are omitted here because they conflict across device families.
+#   - Missing translations (K1/OCLEANR3W/V1 series) are also omitted.
+#   - pNums 21-50: OCLEANX1, OCLEANA1, OCLEANY2 family
+#   - pNums 72-104: OCLEANY3, OCLEANY5, OCLEANR3W, OCLEANV1/V20 family (newer devices)
+SCHEME_NAMES: dict[int, str] = {
+    # OCLEANX1 / OCLEANA1 / OCLEANY2 family
+    21: "Sensitive Cleaning",
+    23: "Robust Cleaning",
+    24: "Beginner",
+    25: "Strong Cleaning",
+    26: "Sugary Diet Cleaning",
+    27: "Gestation Period Cleaning",
+    28: "Strong Whitening",
+    30: "Gum Care",
+    31: "Standard Quick Cleaning",
+    32: "Standard Whitening",
+    34: "Deep Cleaning",
+    36: "Braces Cleaning",
+    37: "Sensitive Cleaning",
+    38: "Robust Whitening",
+    39: "Gentle Teeth Spa",
+    40: "Teeth Spa",
+    41: "Strong Teeth Spa",
+    42: "Gentle Quick Cleaning",
+    43: "Beginner",
+    44: "Whitening",
+    45: "Gum Massage",
+    46: "Travel",
+    47: "18 Days Whitening",
+    48: "24 Days Whitening",
+    49: "Teeth Strengthening",
+    50: "Super Cleaning",
+    53: "Standard Brushing Regimen",
+    # OCLEANY3 / OCLEANY5 / OCLEANR3W / OCLEANV1/V20 family (newer models)
+    72: "Strong Cleaning",
+    73: "Super Cleaning",
+    74: "Post-Wash Sensitivity",
+    75: "Standard Whitening",
+    76: "Strong Whitening",
+    77: "Super Whitening",
+    78: "Sensitive Cleaning",
+    79: "Gentle Teeth Spa",
+    80: "Standard Teeth Spa",
+    81: "Deep Cleaning Spa",
+    82: "Gum Care Cleaning",
+    83: "Clear Your Mouth After Meals",
+    84: "Gum Massage",
+    85: "Gum Care Cleaning",
+    86: "Newbie Whitening",
+    87: "Braces Cleaning",
+    88: "Quick Cleaning",
+    89: "Travel",
+    90: "Gestation Care",
+    91: "Gentle Teeth Spa",
+    92: "Standard Teeth Spa",
+    93: "Deep Cleaning Spa",
+    94: "Newbie Whitening",
+    95: "Strong Whitening",
+    96: "Super Whitening",
+    97: "Sensitive Cleaning",
+    98: "Braces Cleaning",
+    99: "Strong Cleaning",
+    100: "Super Cleaning",
+    101: "Gestation Care",
+    102: "Gum Care Cleaning",
+    103: "Travel",
+    104: "Gum Care Cleaning",
+}
+
+# OCLEANY3M brush scheme presets.
+# Source: GET /Romap/v1/DeviceContoller/GetAllResources, dataBrushScheme.program,
+#         filtered to deviceType == "OCLEANY3M" (exact), fetched 2026-03-22.
+# dict: pnum -> (english_name, [(gear, duration_seconds), ...])
+# Gear values: 1-32 = Clean intensity 1-32, 33-36 = Whitening 1-4,
+#              37-40 = Massage 1-4, 41 = extended (above documented range).
+OCLEANY3M_SCHEMES: dict[int, tuple[str, list[tuple[int, int]]]] = {
+    0: ("Standard Clean", [(2, 30), (2, 30), (2, 30), (2, 30)]),
+    72: ("Medium-Strong Clean", [(16, 30), (16, 30), (24, 30), (16, 30), (16, 30), (37, 30)]),
+    73: ("Strong Clean", [(38, 30), (24, 30), (24, 30), (24, 30), (24, 30), (32, 30)]),
+    74: ("Post-Wash Sensitive", [(8, 30), (8, 30), (37, 30), (8, 30), (8, 30)]),
+    75: ("Daily Whitening", [(34, 30), (34, 30), (24, 30), (16, 30), (16, 30)]),
+    76: ("Medium Whitening", [(32, 30), (35, 30), (24, 30), (24, 30), (35, 30)]),
+    77: ("Super Whitening", [(32, 30), (36, 30), (32, 30), (36, 30), (32, 30)]),
+    78: ("Sensitive Clean", [(37, 30), (41, 30), (41, 30), (41, 30), (41, 30), (41, 30)]),
+    79: ("Gentle SPA", [(8, 30), (33, 30), (33, 30), (37, 30), (37, 30), (8, 30)]),
+    80: ("Standard SPA", [(38, 30), (38, 30), (34, 30), (34, 30), (16, 30), (16, 30)]),
+    81: ("Deep SPA", [(39, 30), (35, 30), (24, 30), (24, 30), (39, 30), (35, 30)]),
+    82: ("After Sweets", [(18, 30), (18, 30), (12, 30), (12, 30)]),
+    83: ("Post-Meal Fresh", [(41, 30), (41, 30), (1, 30), (41, 30), (41, 30)]),
+    84: ("Gum Massage", [(38, 30), (38, 30), (38, 30), (38, 30)]),
+    85: ("Gum Care Clean", [(8, 30), (8, 30), (37, 30), (8, 30), (8, 30), (37, 20), (8, 30)]),
+    86: ("Beginner Whitening", [(33, 30), (6, 30), (33, 30), (6, 30), (6, 30)]),
+    87: ("Braces Clean", [(8, 30), (8, 30), (8, 30), (8, 30), (8, 30), (8, 30)]),
+    88: ("Quick Clean", [(30, 20), (30, 20), (30, 20), (30, 20)]),
+    89: ("Travel", [(17, 30), (17, 30), (35, 30), (35, 30)]),
+}
+
+# OCLEANY3 brush scheme presets (TYPE1 devices: OCLEANY3, OCLEANY3S, OCLEANY3T).
+# Extends OCLEANY3M_SCHEMES with pnum 90 (Gestation Care), which is exclusive to
+# the OCLEANY3 deviceType in the GetAllResources API response.
+OCLEANY3_SCHEMES: dict[int, tuple[str, list[tuple[int, int]]]] = {
+    **OCLEANY3M_SCHEMES,
+    90: ("Gestation Care", [(12, 30), (12, 30), (20, 30), (38, 30), (12, 30), (12, 30)]),
+}
+
+# OCLEANY5 (Oclean Z1) brush scheme presets.
+# Source: GET /Romap/v1/DeviceContoller/GetAllResources, dataBrushScheme.program,
+#         filtered to deviceType == "OCLEANY5", fetched 2026-03-22.
+# BLE encoding: same AbstractC0002b.m28p() as TYPE1 — confirmed via C3350f.java line 61.
+# Write characteristic: WRITE_CHAR_UUID (fbb85), unlike TYPE1 which uses SEND_BRUSH_CMD_UUID.
+OCLEANY5_SCHEMES: dict[int, tuple[str, list[tuple[int, int]]]] = {
+    0: ("Standard Clean", [(2, 30), (2, 30), (2, 30), (2, 30)]),
+    91: ("Gentle Teeth Spa", [(33, 30), (33, 30), (37, 30), (8, 30), (37, 30), (8, 30)]),
+    92: ("Standard Teeth Spa", [(16, 30), (34, 30), (38, 30), (16, 30), (38, 30), (34, 30)]),
+    93: ("Deep Cleaning Spa", [(40, 30), (24, 30), (40, 30), (36, 30), (36, 30), (24, 30)]),
+    94: ("Newbie Whitening", [(6, 30), (33, 30), (33, 30), (6, 30), (6, 30)]),
+    95: ("Strong Whitening", [(24, 30), (34, 30), (32, 30), (24, 30), (34, 30)]),
+    96: ("Super Whitening", [(36, 30), (36, 30), (32, 30), (32, 30), (32, 30)]),
+    97: ("Sensitive Cleaning", [(41, 30), (41, 30), (41, 30), (37, 30), (41, 30), (41, 30)]),
+    98: ("Braces Cleaning", [(8, 30), (8, 30), (8, 30), (8, 30), (8, 30), (8, 30)]),
+    99: ("Strong Cleaning", [(16, 30), (37, 30), (16, 30), (16, 30), (24, 30), (16, 30)]),
+    100: ("Super Cleaning", [(38, 30), (32, 30), (24, 30), (24, 30), (24, 30), (24, 30)]),
+    101: ("Gestation Care", [(12, 30), (12, 30), (12, 30), (20, 30), (12, 30), (38, 30)]),
+    102: ("Gum Care Cleaning", [(12, 30), (18, 30), (18, 30), (12, 30)]),
+    103: ("Travel", [(17, 30), (36, 30), (36, 30), (17, 30)]),
+    104: ("Gum Care Cleaning", [(8, 30), (8, 30), (8, 30), (8, 30), (8, 30), (37, 20), (37, 30)]),
+}
+
+# Per-model scheme dict overrides.  Models not listed fall back to OCLEANY3M_SCHEMES
+# (which covers all other TYPE1 devices: OCLEANY3M*, OCLEANY3P*, OCLEANY3D*, OCLEANX20, …).
+SCHEMES_BY_MODEL: dict[str, dict[int, tuple[str, list[tuple[int, int]]]]] = {
+    "OCLEANY3": OCLEANY3_SCHEMES,  # has exclusive pnum 90
+    "OCLEANY3S": OCLEANY3_SCHEMES,
+    "OCLEANY3T": OCLEANY3_SCHEMES,
+    "OCLEANY5": OCLEANY5_SCHEMES,  # Oclean Z1 — different pnum range (91-104)
+}
+
+# Persistent storage for session history
+STORAGE_VERSION = 1
+
+# Max number of 0309 pages to fetch per poll (safety limit)
+MAX_SESSION_PAGES = 50

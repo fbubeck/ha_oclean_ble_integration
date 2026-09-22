@@ -1,0 +1,72 @@
+"""Shared entity base class for the Oclean BLE integration."""
+from __future__ import annotations
+
+from typing import Any
+
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DATA_LAST_BRUSH_TIME, DATA_ZONE_HISTORY, DOMAIN, MANUFACTURER
+from .coordinator import OcleanCoordinator
+
+
+class OcleanEntity(CoordinatorEntity[OcleanCoordinator]):
+    """Template base class shared by all Oclean entities.
+
+    Consolidates the boilerplate that was duplicated across
+    OcleanSensor, OcleanBinarySensor, and OcleanButton:
+      - _attr_has_entity_name
+      - _attr_unique_id construction
+      - _attr_device_info construction
+      - a sensible default for ``available``
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: OcleanCoordinator,
+        mac: str,
+        device_name: str,
+        unique_id_suffix: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._mac = mac
+        self._attr_unique_id = f"{mac}_{unique_id_suffix}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, mac)},
+            name=device_name,
+            manufacturer=MANUFACTURER,
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return True when the coordinator holds any data (including stale)."""
+        return self.coordinator.data is not None
+
+    def _session_field_available(self, value: Any) -> bool:
+        """Shared availability logic for session-derived sensor fields.
+
+        Returns False when at least one session has been received
+        (DATA_LAST_BRUSH_TIME is set) but *value* has never been populated,
+        indicating structural unavailability on this device.
+        Falls back to stale-data availability when the last poll failed.
+
+        Exception: if zone_history has entries the device has previously delivered
+        full session data, so any currently-absent field is only *temporarily*
+        missing (e.g. inline-mode poll with no new sessions) — not structurally
+        unsupported.  In that case we keep the sensor available so it shows its
+        last known value once data arrives again.
+        """
+        if not self.coordinator.last_update_success:
+            return value is not None
+        if value is not None:
+            return True
+        data = self.coordinator.data
+        if data is None or data.get(DATA_LAST_BRUSH_TIME) is None:
+            return True
+        # Device has zone history → all session fields are supported, just absent now.
+        history = data.get(DATA_ZONE_HISTORY)
+        if isinstance(history, list) and history:
+            return True
+        return False

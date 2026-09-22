@@ -1,0 +1,2489 @@
+"""Unit tests for parser.py – no Home Assistant required."""
+
+from __future__ import annotations
+
+import calendar
+import datetime
+import json
+
+import pytest
+
+from custom_components.oclean_ble.const import (
+    DATA_BATTERY,
+    DATA_BRUSH_HEAD_DAYS,
+    DATA_BRUSH_HEAD_USAGE,
+    DATA_BRUSH_MODE,
+    DATA_LAST_BRUSH_DURATION,
+    DATA_LAST_BRUSH_PNUM,
+    DATA_LAST_BRUSH_SCORE,
+    DATA_LAST_BRUSH_TIME,
+    RESP_BRUSH_AREAS_T1,
+    RESP_BRUSH_AREAS_Y3P,
+    RESP_DEVICE_SETTINGS,
+    RESP_EXTENDED_T1,
+    RESP_INFO,
+    RESP_INFO_T1,
+    RESP_K3GUIDE,
+    RESP_SCORE_T1,
+    RESP_SESSION_META_T1,
+    RESP_SESSION_META_Y3P,
+    TOOTH_AREA_NAMES,
+)
+from custom_components.oclean_ble.parser import (
+    _MIN_YEAR,
+    T1_C3352G_RECORD_SIZE,
+    _device_datetime,
+    _log_4b00_response,
+    _map_json_brush_data,
+    _parse_0314_response,
+    _parse_brush_areas_t1_response,
+    _parse_brush_areas_y3p_response,
+    _parse_device_settings_response,
+    _parse_extended_running_data_record,
+    _parse_info_response,
+    _parse_info_t1_response,
+    _parse_k3guide_response,
+    _parse_m18f_record,
+    _parse_running_data_record,
+    _parse_score_t1_response,
+    _parse_session_meta_t1_response,
+    _parse_session_meta_y3p_response,
+    _parse_state_response,
+    _parse_t1_ocleanx20_inline,
+    parse_battery,
+    parse_notification,
+    parse_t1_c3352g_record,
+    parse_t1_c3385w0_record,
+    parse_y3p_stream_record,
+)
+
+# ---------------------------------------------------------------------------
+# Helper: build a syntactically valid 18-byte running-data record
+# ---------------------------------------------------------------------------
+
+
+def _make_record(
+    *,
+    year: int = 2024,
+    month: int = 3,
+    day: int = 15,
+    hour: int = 8,
+    minute: int = 30,
+    second: int = 0,
+    tz_quarters: int = 32,  # +32 × 15 min = UTC+8
+    week: int = 11,
+    p_num: int = 1,
+    blunt_teeth: int = 5,
+    pressure_raw: int = 600,  # → 600/300 = 2.0
+    padding: int = 0,  # value for unknown bytes 9–13
+    extra: bytes = b"",  # appended after byte 17
+) -> bytes:
+    """Build a minimal 18-byte (+ extra) running-data record."""
+    record = bytearray(18)
+    record[0] = year - 2000
+    record[1] = month
+    record[2] = day
+    record[3] = hour
+    record[4] = minute
+    record[5] = second
+    record[6] = tz_quarters % 256  # signed → unsigned byte storage
+    record[7] = week
+    record[8] = p_num
+    record[9:14] = bytes([padding] * 5)  # unknown bytes
+    record[14:16] = blunt_teeth.to_bytes(2, "little")
+    record[16:18] = pressure_raw.to_bytes(2, "little")
+    return bytes(record) + extra
+
+
+def _expected_utc_ts(year, month, day, hour, minute, second, tz_quarters) -> int:
+    """Compute the expected UTC unix timestamp using the same logic as the parser."""
+    tz_offset_quarters = tz_quarters if tz_quarters < 128 else tz_quarters - 256
+    tz_offset_minutes = tz_offset_quarters * 15
+    device_dt = datetime.datetime(year, month, day, hour, minute, second)
+    utc_dt = device_dt - datetime.timedelta(minutes=tz_offset_minutes)
+    return calendar.timegm(utc_dt.timetuple())
+
+
+# ---------------------------------------------------------------------------
+# _device_datetime helper
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceDatetime:
+    """Tests for _device_datetime() – the shared year-2000 datetime builder."""
+
+    # --- Happy path ---
+
+    def test_returns_correct_datetime(self):
+        dt = _device_datetime(24, 3, 15, 8, 30, 0)
+        assert dt == datetime.datetime(2024, 3, 15, 8, 30, 0)
+
+    def test_year_offset_applied(self):
+        """year_byte + 2000 must equal the returned year."""
+        dt = _device_datetime(26, 1, 1, 0, 0, 0)
+        assert dt.year == 2026
+
+    def test_all_fields_preserved(self):
+        dt = _device_datetime(23, 11, 7, 22, 59, 45)
+        assert (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second) == (2023, 11, 7, 22, 59, 45)
+
+    def test_leap_day_accepted(self):
+        """Feb 29 in a leap year must not raise."""
+        dt = _device_datetime(24, 2, 29, 12, 0, 0)  # 2024 is a leap year
+        assert dt.day == 29
+
+    def test_min_year_boundary_accepted(self):
+        """_MIN_YEAR itself must be accepted."""
+        dt = _device_datetime(_MIN_YEAR - 2000, 6, 1, 0, 0, 0)
+        assert dt.year == _MIN_YEAR
+
+    def test_year_99_accepted(self):
+        """year_byte=99 → year 2099 is valid."""
+        dt = _device_datetime(99, 1, 1, 0, 0, 0)
+        assert dt.year == 2099
+
+    # --- Year-validation boundary ---
+
+    def test_year_below_min_raises(self):
+        """Any year below _MIN_YEAR must raise ValueError."""
+        import pytest
+
+        with pytest.raises(ValueError, match="implausible year"):
+            _device_datetime(_MIN_YEAR - 2000 - 1, 1, 1, 0, 0, 0)
+
+    def test_year_zero_raises(self):
+        """year_byte=0 → year 2000 → rejected."""
+        with pytest.raises(ValueError, match="implausible year"):
+            _device_datetime(0, 1, 1, 0, 0, 0)
+
+    def test_year_14_raises(self):
+        """year_byte=14 → year 2014 → rejected."""
+        with pytest.raises(ValueError, match="implausible year"):
+            _device_datetime(14, 6, 15, 12, 0, 0)
+
+    # --- Invalid dates (delegated to datetime constructor) ---
+
+    def test_month_zero_raises(self):
+        with pytest.raises(ValueError, match="month must be in"):
+            _device_datetime(24, 0, 1, 0, 0, 0)
+
+    def test_month_13_raises(self):
+        with pytest.raises(ValueError, match="month must be in"):
+            _device_datetime(24, 13, 1, 0, 0, 0)
+
+    def test_day_zero_raises(self):
+        with pytest.raises(ValueError, match="day is out of range"):
+            _device_datetime(24, 1, 0, 0, 0, 0)
+
+    def test_day_32_raises(self):
+        with pytest.raises(ValueError, match="day is out of range"):
+            _device_datetime(24, 1, 32, 0, 0, 0)
+
+    def test_hour_24_raises(self):
+        with pytest.raises(ValueError, match="hour must be in"):
+            _device_datetime(24, 1, 1, 24, 0, 0)
+
+    def test_minute_60_raises(self):
+        with pytest.raises(ValueError, match="minute must be in"):
+            _device_datetime(24, 1, 1, 0, 60, 0)
+
+    def test_second_60_raises(self):
+        with pytest.raises(ValueError, match="second must be in"):
+            _device_datetime(24, 1, 1, 0, 0, 60)
+
+    def test_leap_day_in_non_leap_year_raises(self):
+        """Feb 29 in a non-leap year must raise."""
+        with pytest.raises(ValueError, match="day is out of range"):
+            _device_datetime(23, 2, 29, 0, 0, 0)  # 2023 is not a leap year
+
+
+# ---------------------------------------------------------------------------
+# parse_battery
+# ---------------------------------------------------------------------------
+
+
+class TestParseBattery:
+    def test_valid_value(self):
+        assert parse_battery(bytes([75])) == 75
+
+    def test_zero(self):
+        assert parse_battery(bytes([0])) == 0
+
+    def test_full(self):
+        assert parse_battery(bytes([100])) == 100
+
+    def test_empty_bytes(self):
+        assert parse_battery(b"") is None
+
+    def test_over_100_returns_none(self):
+        assert parse_battery(bytes([101])) is None
+        assert parse_battery(bytes([255])) is None
+
+    def test_ignores_trailing_bytes(self):
+        # Standard BLE battery char is 1 byte; extra bytes should be ignored
+        assert parse_battery(bytes([80, 0, 0])) == 80
+
+
+# ---------------------------------------------------------------------------
+# parse_notification – routing
+# ---------------------------------------------------------------------------
+
+
+class TestParseNotificationRouting:
+    def test_empty_returns_empty(self):
+        assert parse_notification(b"") == {}
+
+    def test_single_byte_returns_empty(self):
+        assert parse_notification(bytes([0x09])) == {}
+
+    def test_state_response_routed(self):
+        # 03 03 + observed real payload (Oclean X, idle): 02 0e 4b 1d 00 00
+        # byte 3 = 0x1d = 29 → battery
+        data = bytes([0x03, 0x03, 0x02, 0x0E, 0x4B, 0x1D, 0x00, 0x00])
+        result = parse_notification(data)
+        assert result["battery"] == 29
+
+    def test_state_response_routed_minimal(self):
+        # 03 03 + short payload (< 4 bytes) → no battery
+        data = bytes([0x03, 0x03, 0x02])
+        result = parse_notification(data)
+        assert "battery" not in result
+
+    def test_info_response_routed(self):
+        # 03 08 → info response with short payload → {}
+        data = bytes([0x03, 0x08, 0xAA, 0xBB])
+        result = parse_notification(data)
+        assert result == {}
+
+    def test_info_response_short_status_packet(self):
+        # 0308 with payload[0]==0, payload[1]==12 < 32 – "no-session" ack from
+        # OCLEANY3MH device (observed in issue #19 logs).  Should return {} silently.
+        data = bytes.fromhex("0308000c021c173bc7f97dd34f4b")
+        result = parse_notification(data)
+        assert result == {}
+
+    def test_device_info_ack_routed(self):
+        # 02 02 4F 4B → device-info ACK ("OK"), no sensor data
+        data = bytes([0x02, 0x02, 0x4F, 0x4B])
+        result = parse_notification(data)
+        assert result == {}
+
+    def test_json_fallback(self):
+        payload = json.dumps({"score": 88}).encode()
+        result = parse_notification(payload)
+        assert result.get("last_brush_score") == 88
+
+    def test_unknown_binary_returns_empty(self):
+        data = bytes([0xFF, 0xFF, 0x01, 0x02, 0x03])
+        result = parse_notification(data)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _parse_state_response
+# ---------------------------------------------------------------------------
+
+
+class TestParseStateResponse:
+    def test_battery_extracted_from_byte3(self):
+        # Observed on Oclean X: byte 3 = battery %.
+        # Payload after 0303 prefix: 02 0e XX battery 00 00
+        payload = bytes([0x02, 0x0E, 0x4B, 0x1D, 0x00, 0x00])  # battery = 0x1d = 29
+        result = _parse_state_response(payload)
+        assert result["battery"] == 29
+
+    def test_battery_extracted_various_values(self):
+        payload = bytes([0x02, 0x0E, 0x39, 0x19, 0x00, 0x00])  # battery = 0x19 = 25
+        assert _parse_state_response(payload)["battery"] == 25
+
+    def test_battery_out_of_range_ignored(self):
+        # Values > 100 are not a valid battery level
+        payload = bytes([0x02, 0x0E, 0x00, 0x80, 0x00, 0x00])  # 0x80 = 128 → skip
+        result = _parse_state_response(payload)
+        assert "battery" not in result
+
+    def test_short_payload_no_crash(self):
+        # Payloads shorter than 1 byte → no battery, no crash
+        assert _parse_state_response(b"") == {}
+        # 1-byte payload → no battery
+        result = _parse_state_response(bytes([0x02]))
+        assert result == {}
+        # 3-byte payload → no battery (byte 3 absent)
+        result = _parse_state_response(bytes([0x02, 0x0E, 0x39]))
+        assert result == {}
+
+    def test_empty_payload_returns_empty(self):
+        assert _parse_state_response(b"") == {}
+
+    def test_exact_4_bytes_extracts_battery(self):
+        payload = bytes([0x02, 0x0E, 0x38, 0x1B])  # battery = 0x1b = 27
+        assert _parse_state_response(payload)["battery"] == 27
+
+
+# ---------------------------------------------------------------------------
+# _map_json_brush_data
+# ---------------------------------------------------------------------------
+
+
+class TestMapJsonBrushData:
+    def test_camel_case_keys(self):
+        data = {
+            "brushScore": 75,
+            "brushDuration": 120,
+            "cleanScore": 90,
+            "avgPressure": 42,
+            "endTime": 1700000000,
+        }
+        result = _map_json_brush_data(data)
+        assert result["last_brush_score"] == 75
+        assert result["last_brush_duration"] == 120
+        assert result["last_brush_pressure"] == 42
+        assert result["last_brush_time"] == 1700000000
+
+    def test_snake_case_keys(self):
+        data = {
+            "score": 60,
+            "duration": 90,
+            "clean": 80,
+            "pressure": 100,
+            "timestamp": 1700000001,
+        }
+        result = _map_json_brush_data(data)
+        assert result["last_brush_score"] == 60
+        assert result["last_brush_duration"] == 90
+        assert result["last_brush_pressure"] == 100
+        assert result["last_brush_time"] == 1700000001
+
+    def test_unknown_keys_returns_empty(self):
+        result = _map_json_brush_data({"foo": 1, "bar": 2})
+        assert result == {}
+
+    def test_partial_keys(self):
+        result = _map_json_brush_data({"score": 55})
+        assert result == {"last_brush_score": 55}
+        assert "last_brush_duration" not in result
+
+    def test_priority_first_match_wins(self):
+        # "score" comes before "brushScore" in the search order
+        data = {"score": 10, "brushScore": 99}
+        result = _map_json_brush_data(data)
+        assert result["last_brush_score"] == 10
+
+    def test_string_score_cast_to_int(self):
+        result = _map_json_brush_data({"score": "72"})
+        assert result["last_brush_score"] == 72
+        assert isinstance(result["last_brush_score"], int)
+
+
+# ---------------------------------------------------------------------------
+# _parse_running_data_record  (new binary parser from C3340b1.m5348m1)
+# ---------------------------------------------------------------------------
+
+
+class TestParseRunningDataRecord:
+    # --- Happy path ---
+
+    def test_utc_plus8_timestamp(self):
+        """Device in UTC+8: local 08:30 → UTC 00:30."""
+        record = _make_record(
+            year=2024,
+            month=3,
+            day=15,
+            hour=8,
+            minute=30,
+            second=0,
+            tz_quarters=32,  # +32 × 15 min = +480 min = UTC+8
+        )
+        result = _parse_running_data_record(record)
+        expected_ts = _expected_utc_ts(2024, 3, 15, 8, 30, 0, 32)
+        assert result["last_brush_time"] == expected_ts
+
+    def test_utc_minus5_timestamp(self):
+        """Device in UTC-5: local 12:00 → UTC 17:00."""
+        # -20 quarter-hours stored as 256 - 20 = 236
+        record = _make_record(
+            year=2024,
+            month=3,
+            day=15,
+            hour=12,
+            minute=0,
+            second=0,
+            tz_quarters=236,  # 236 - 256 = -20 → -300 min = UTC-5
+        )
+        result = _parse_running_data_record(record)
+        expected_ts = _expected_utc_ts(2024, 3, 15, 12, 0, 0, 236)
+        assert result["last_brush_time"] == expected_ts
+
+    def test_utc_zero_timezone(self):
+        """Device in UTC: no offset, timestamps are identical."""
+        record = _make_record(
+            year=2024,
+            month=1,
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            tz_quarters=0,
+        )
+        result = _parse_running_data_record(record)
+        expected_ts = _expected_utc_ts(2024, 1, 1, 0, 0, 0, 0)
+        assert result["last_brush_time"] == expected_ts
+
+    def test_pressure_calculation(self):
+        """pressure_raw / 300, rounded to 2 decimal places."""
+        record = _make_record(pressure_raw=600)
+        result = _parse_running_data_record(record)
+        assert result["last_brush_pressure"] == 2.0
+
+    def test_pressure_non_round(self):
+        """Non-divisible raw value rounds to 2 decimals."""
+        record = _make_record(pressure_raw=100)
+        result = _parse_running_data_record(record)
+        # 100 / 300 = 0.333...
+        assert result["last_brush_pressure"] == round(100 / 300, 2)
+
+    def test_pressure_zero(self):
+        record = _make_record(pressure_raw=0)
+        result = _parse_running_data_record(record)
+        assert result["last_brush_pressure"] == 0.0
+
+    def test_pressure_max_uint16(self):
+        """65535 / 300 = 218.45."""
+        record = _make_record(pressure_raw=65535)
+        result = _parse_running_data_record(record)
+        assert result["last_brush_pressure"] == round(65535 / 300, 2)
+
+    def test_exact_18_bytes_accepted(self):
+        """Exactly 18 bytes is the minimum valid record."""
+        record = _make_record()
+        assert len(record) == 18
+        result = _parse_running_data_record(record)
+        assert "last_brush_time" in result
+        assert "last_brush_pressure" in result
+
+    def test_extra_trailing_bytes_ignored(self):
+        """Records longer than 18 bytes (unknown fields) are accepted."""
+        record = _make_record(extra=bytes([0xDE, 0xAD, 0xBE, 0xEF]))
+        assert len(record) == 22
+        result = _parse_running_data_record(record)
+        assert "last_brush_time" in result
+
+    def test_returns_only_known_keys(self):
+        """Only last_brush_time, last_brush_pressure, and brush_head_usage are returned."""
+        result = _parse_running_data_record(_make_record())
+        assert set(result.keys()) == {"last_brush_time", "last_brush_pressure", "brush_head_usage"}
+
+    # --- Year / month boundary ---
+
+    def test_year_before_2015_rejected(self):
+        """Years before 2015 are invalid (no Oclean devices existed then)."""
+        record = _make_record(year=2000, month=1, day=1)
+        result = _parse_running_data_record(record)
+        assert result == {}
+
+    def test_year_boundary_2015_accepted(self):
+        """Exactly 2015 is the minimum accepted year."""
+        record = _make_record(year=2015, month=1, day=1)
+        result = _parse_running_data_record(record)
+        assert "last_brush_time" in result
+
+    def test_year_boundary_2099(self):
+        """byte 0 = 99 → year 2099."""
+        record = _make_record(year=2099, month=12, day=31)
+        result = _parse_running_data_record(record)
+        assert result["last_brush_time"] is not None
+
+    # --- Edge cases / error paths ---
+
+    def test_too_short_returns_empty(self):
+        """Payloads shorter than 18 bytes must return {}."""
+        assert _parse_running_data_record(b"") == {}
+        assert _parse_running_data_record(bytes(17)) == {}
+
+    def test_17_bytes_returns_empty(self):
+        assert _parse_running_data_record(bytes(17)) == {}
+
+    def test_invalid_date_returns_empty(self):
+        """An impossible date (month=13) triggers ValueError → returns {}."""
+        record = _make_record(month=13)
+        assert _parse_running_data_record(record) == {}
+
+    def test_invalid_date_day_zero_returns_empty(self):
+        """Day=0 is an impossible date."""
+        record = _make_record(day=0)
+        assert _parse_running_data_record(record) == {}
+
+    def test_pressure_little_endian_byte_order(self):
+        """Verify LE byte order: raw=0x0102 → bytes [0x02, 0x01] at positions 16–17."""
+        record = bytearray(_make_record(pressure_raw=0))
+        # Manually write 0x0102 in little-endian: low byte first
+        record[16] = 0x02
+        record[17] = 0x01
+        result = _parse_running_data_record(bytes(record))
+        # 0x0102 = 258
+        assert result["last_brush_pressure"] == round(258 / 300, 2)
+
+    def test_blunt_teeth_little_endian(self):
+        """blunt_teeth uses LE: value 0x0200 = 512 → bytes [0x00, 0x02]."""
+        record = bytearray(_make_record(blunt_teeth=0))
+        record[14] = 0x00
+        record[15] = 0x02
+        # blunt_teeth = 512; not in output dict but must not cause a crash
+        result = _parse_running_data_record(bytes(record))
+        assert "last_brush_time" in result
+
+
+# ---------------------------------------------------------------------------
+# _parse_info_response  (wraps _parse_running_data_record)
+# ---------------------------------------------------------------------------
+
+
+class TestParseInfoResponse:
+    def test_valid_record_returns_data(self):
+        """A full 18-byte payload is parsed into brush data."""
+        payload = _make_record(pressure_raw=300)  # → 1.0
+        result = _parse_info_response(payload)
+        assert result["last_brush_pressure"] == 1.0
+        assert "last_brush_time" in result
+
+    def test_too_short_payload_returns_empty(self):
+        """Payload shorter than _RUNNING_DATA_MIN_RECORD_SIZE returns {}."""
+        assert _parse_info_response(b"") == {}
+        assert _parse_info_response(bytes(10)) == {}
+
+    def test_exact_minimum_size_parsed(self):
+        payload = _make_record()
+        assert len(payload) == 18
+        result = _parse_info_response(payload)
+        assert result != {}
+
+    def test_invalid_date_falls_through_to_empty(self):
+        """Bad date in record → {} (no crash)."""
+        result = _parse_info_response(_make_record(month=0))
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_notification → INFO routing (end-to-end through the full chain)
+# ---------------------------------------------------------------------------
+
+
+class TestParseNotificationInfoRouting:
+    def test_info_notification_with_valid_record(self):
+        """03 07 header + valid 18-byte record → brush data extracted."""
+        payload = RESP_INFO + _make_record(pressure_raw=450)
+        result = parse_notification(payload)
+        assert result["last_brush_pressure"] == round(450 / 300, 2)
+        assert "last_brush_time" in result
+
+    def test_info_notification_too_short_record(self):
+        """03 07 header + only 4 bytes payload → {} (too short for a record)."""
+        payload = RESP_INFO + bytes([0xAA, 0xBB, 0xCC, 0xDD])
+        result = parse_notification(payload)
+        assert result == {}
+
+    def test_info_notification_exact_minimum(self):
+        """03 07 header + exactly 18 bytes → parsed."""
+        payload = RESP_INFO + _make_record()
+        result = parse_notification(payload)
+        assert "last_brush_time" in result
+
+    def test_info_notification_utc_timestamp_correctness(self):
+        """Full notification round-trip preserves UTC conversion."""
+        tz_quarters = 32  # UTC+8
+        rec = _make_record(
+            year=2025,
+            month=6,
+            day=21,
+            hour=9,
+            minute=0,
+            second=0,
+            tz_quarters=tz_quarters,
+            pressure_raw=300,
+        )
+        result = parse_notification(RESP_INFO + rec)
+        expected = _expected_utc_ts(2025, 6, 21, 9, 0, 0, tz_quarters)
+        assert result["last_brush_time"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Type-1 (0307) records
+# ---------------------------------------------------------------------------
+
+
+def _make_t1_record(
+    *,
+    year: int = 2026,
+    month: int = 2,
+    day: int = 21,
+    hour: int = 16,
+    minute: int = 25,
+    second: int = 31,
+    pnum: int = 0,
+    duration: int = 0,
+    valid_duration: int | None = None,
+    extra: bytes = b"",
+) -> bytes:
+    """Build a Type-1 (0307) running-data payload (16 bytes header + extra).
+
+    Byte layout (confirmed via APK AbstractC0002b.m18f, empirical 2026-06-08):
+      bytes 0-2 : magic "*B#"  (0x2a 0x42 0x23)
+      bytes 3-4 : session count 0x0000
+      bytes 5-10: timestamp (year-2000, month, day, hour, minute, second)
+      byte  11  : pNum (brush-scheme ID)
+      bytes 12-13: duration (preset/goal, 2-byte BE)
+      bytes 14-15: validDuration (actual brushing time, 2-byte BE) — parser prefers this
+      extra     : bytes 16+ (additional payload)
+
+    If valid_duration is None, it defaults to the same value as duration so tests
+    that only specify duration get consistent behaviour.
+    """
+    if valid_duration is None:
+        valid_duration = duration
+    header = bytearray(16)
+    header[0:5] = b"\x2a\x42\x23\x00\x00"  # magic "*B#" + session count
+    header[5] = year - 2000
+    header[6] = month
+    header[7] = day
+    header[8] = hour
+    header[9] = minute
+    header[10] = second
+    header[11] = pnum
+    header[12] = (duration >> 8) & 0xFF
+    header[13] = duration & 0xFF
+    header[14] = (valid_duration >> 8) & 0xFF
+    header[15] = valid_duration & 0xFF
+    return bytes(header) + extra
+
+
+def _expected_t1_ts(year, month, day, hour, minute, second) -> int:
+    """Expected unix timestamp from Type-1 record (device local time → system local tz)."""
+    import time
+
+    return int(time.mktime(datetime.datetime(year, month, day, hour, minute, second).timetuple()))
+
+
+# ---------------------------------------------------------------------------
+# _parse_info_t1_response  (Type-1 / 0307 running-data)
+# ---------------------------------------------------------------------------
+
+
+class TestParseInfoT1Response:
+    # --- Real observed payloads (ground truth) ---
+
+    def test_real_session_7s(self):
+        """Short brush: timestamp, pNum=231, duration=30 s extracted."""
+        # raw: 03072a422300001a021510191fe7001e001e6400
+        # payload[11]=0xe7=231 (pNum), payload[12:14]=0x001e=30 s (duration)
+        payload = bytes.fromhex("2a422300001a021510191fe7001e001e6400")
+        result = _parse_info_t1_response(payload)
+        expected_ts = _expected_t1_ts(2026, 2, 21, 16, 25, 31)
+        assert result["last_brush_time"] == expected_ts
+        assert result["last_brush_pnum"] == 231
+        assert result["last_brush_duration"] == 30
+        assert "last_brush_score" not in result
+
+    def test_real_session_2min(self):
+        """2-min brush: timestamp, pNum=0, duration=120 s extracted."""
+        # raw: 03072a422300001a0215102c1c00007800780201
+        # payload[11]=0x00=0 (pNum), payload[12:14]=0x0078=120 s (duration)
+        payload = bytes.fromhex("2a422300001a0215102c1c00007800780201")
+        result = _parse_info_t1_response(payload)
+        expected_ts = _expected_t1_ts(2026, 2, 21, 16, 44, 28)
+        assert result["last_brush_time"] == expected_ts
+        assert result["last_brush_pnum"] == 0
+        assert result["last_brush_duration"] == 120
+        assert "last_brush_score" not in result
+
+    def test_real_session_150s(self):
+        """150 s brush: timestamp, pNum=77, duration=150 s extracted."""
+        # raw: 03072a422300001a02150f2a134d009600962704
+        # payload[11]=0x4d=77 (pNum), payload[12:14]=0x0096=150 s (duration)
+        payload = bytes.fromhex("2a422300001a02150f2a134d009600962704")
+        result = _parse_info_t1_response(payload)
+        assert result["last_brush_pnum"] == 77
+        assert result["last_brush_duration"] == 150
+        assert "last_brush_score" not in result
+
+    def test_score_never_in_result(self):
+        """Score is NOT returned by 0307; it comes from the 0000 notification."""
+        rec = _make_t1_record()
+        assert "last_brush_score" not in _parse_info_t1_response(rec)
+
+    # --- Timestamp ---
+
+    def test_timestamp_extracted_from_bytes_5_10(self):
+        rec = _make_t1_record(year=2025, month=6, day=15, hour=10, minute=5, second=30)
+        result = _parse_info_t1_response(rec)
+        expected = _expected_t1_ts(2025, 6, 15, 10, 5, 30)
+        assert result["last_brush_time"] == expected
+
+    # --- Edge cases ---
+
+    def test_too_short_returns_empty(self):
+        assert _parse_info_t1_response(b"") == {}
+        assert _parse_info_t1_response(bytes(10)) == {}  # need 12 bytes (through pNum)
+        assert _parse_info_t1_response(bytes(11)) == {}  # 11 bytes still too short
+
+    def test_exactly_12_bytes_accepted(self):
+        """Minimum valid payload: 12 bytes (through pNum at byte 11)."""
+        payload = bytearray(12)
+        payload[0:5] = b"\x2a\x42\x23\x00\x00"
+        payload[5] = 26  # year - 2000
+        payload[6] = 2  # month
+        payload[7] = 21  # day
+        payload[8] = 16  # hour
+        payload[9] = 25  # minute
+        payload[10] = 31  # second
+        payload[11] = 42  # pNum
+        result = _parse_info_t1_response(bytes(payload))
+        assert "last_brush_time" in result
+        assert result["last_brush_pnum"] == 42
+        assert "last_brush_duration" not in result  # need 14 bytes for duration
+        assert "last_brush_score" not in result
+
+    def test_invalid_date_returns_empty(self):
+        rec = _make_t1_record(month=13)
+        assert _parse_info_t1_response(rec) == {}
+
+    def test_invalid_day_zero_returns_empty(self):
+        rec = _make_t1_record(day=0)
+        assert _parse_info_t1_response(rec) == {}
+
+
+# ---------------------------------------------------------------------------
+# _parse_m18f_record  (full 42-byte paginated records)
+# ---------------------------------------------------------------------------
+
+
+def _make_m18f_record(
+    *,
+    year: int = 2026,
+    month: int = 3,
+    day: int = 9,
+    hour: int = 7,
+    minute: int = 0,
+    second: int = 0,
+    pnum: int = 87,
+    duration: int = 180,
+    pressure_ratio: tuple = (8, 4, 85, 0, 0),
+    score: int = 82,
+) -> bytes:
+    """Build a full 42-byte m18f session record."""
+    record = bytearray(42)
+    record[0] = year - 2000
+    record[1] = month
+    record[2] = day
+    record[3] = hour
+    record[4] = minute
+    record[5] = second
+    record[6] = pnum
+    record[7] = (duration >> 8) & 0xFF
+    record[8] = duration & 0xFF
+    # bytes 9-10: validDuration (unused by parser)
+    record[9] = record[7]
+    record[10] = record[8]
+    # bytes 11-15: pressureRatio (5 time-distribution % values)
+    for i, v in enumerate(pressure_ratio[:5]):
+        record[11 + i] = v
+    # byte 33: score
+    record[33] = score
+    return bytes(record)
+
+
+def _make_paginated_0307(session_count: int, records: list[bytes]) -> bytes:
+    """Build a 0307 paginated payload (5-byte header + N × 42-byte records)."""
+    header = bytearray(5)
+    header[0:3] = b"\x2a\x42\x23"  # *B#
+    header[3] = (session_count >> 8) & 0xFF
+    header[4] = session_count & 0xFF
+    return bytes(header) + b"".join(records)
+
+
+class TestParseM18fRecord:
+    def test_extracts_all_fields(self):
+        record = _make_m18f_record(score=75, duration=120, pnum=42)
+        result = _parse_m18f_record(record)
+        assert result["last_brush_pnum"] == 42
+        assert result["last_brush_duration"] == 120
+        assert result["last_brush_score"] == 75
+        assert result["last_brush_coverage"] == 60  # 3/5 zones active (8,4,85,0,0)
+        assert result["last_brush_pressure_ratio"] == [8, 4, 85, 0, 0]
+
+    def test_coverage_all_zones(self):
+        record = _make_m18f_record(pressure_ratio=(20, 20, 20, 20, 20))
+        result = _parse_m18f_record(record)
+        assert result["last_brush_coverage"] == 100  # 5/5
+
+    def test_coverage_one_zone(self):
+        record = _make_m18f_record(pressure_ratio=(100, 0, 0, 0, 0))
+        result = _parse_m18f_record(record)
+        assert result["last_brush_coverage"] == 20  # 1/5
+
+    def test_coverage_zero_zones(self):
+        record = _make_m18f_record(pressure_ratio=(0, 0, 0, 0, 0))
+        result = _parse_m18f_record(record)
+        assert result["last_brush_coverage"] == 0  # 0/5
+
+    def test_no_areas_in_m18f(self):
+        """m18f records do not contain per-tooth area pressures."""
+        record = _make_m18f_record(pressure_ratio=(8, 4, 85, 0, 0))
+        result = _parse_m18f_record(record)
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+
+    def test_score_0xff_not_stored(self):
+        record = _make_m18f_record(score=0xFF)
+        result = _parse_m18f_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_0_not_stored(self):
+        record = _make_m18f_record(score=0)
+        result = _parse_m18f_record(record)
+        assert "last_brush_score" not in result
+
+    def test_too_short_returns_empty(self):
+        assert _parse_m18f_record(bytes(41)) == {}
+
+    def test_invalid_year_returns_empty(self):
+        record = bytearray(_make_m18f_record())
+        record[0] = 0  # year 2000 < _MIN_YEAR
+        assert _parse_m18f_record(bytes(record)) == {}
+
+    def test_timestamp_correct(self):
+        record = _make_m18f_record(year=2026, month=3, day=9, hour=7, minute=0, second=0)
+        result = _parse_m18f_record(record)
+        expected = _expected_t1_ts(2026, 3, 9, 7, 0, 0)
+        assert result["last_brush_time"] == expected
+
+
+class TestParseInfoT1Paginated:
+    def test_paginated_score_extracted(self):
+        """session_count=3, full 42-byte record → score is parsed."""
+        record = _make_m18f_record(score=88, pnum=55, duration=150)
+        payload = _make_paginated_0307(3, [record, record, record])
+        result = _parse_info_t1_response(payload)
+        assert result["last_brush_score"] == 88
+        assert result["last_brush_pnum"] == 55
+        assert result["last_brush_duration"] == 150
+
+    def test_paginated_falls_through_when_short(self):
+        """session_count=1 but payload only 18 bytes → treated as inline (no score)."""
+        # This is the real-world case: session_count=1 but inline format
+        payload = bytes.fromhex("2a422300011a02181535134c009600960b03")
+        result = _parse_info_t1_response(payload)
+        assert result["last_brush_pnum"] == 76  # 0x4c
+        assert result["last_brush_duration"] == 150  # 0x0096
+        assert "last_brush_score" not in result
+
+
+# ---------------------------------------------------------------------------
+# parse_notification → Type-1 INFO routing (0307)
+# ---------------------------------------------------------------------------
+
+
+class TestParseNotificationInfoT1Routing:
+    def test_0307_real_session_2min(self):
+        """Real 2-min session: timestamp, pNum=0, duration=120 s extracted."""
+        raw = bytes.fromhex("03072a422300001a0215102c1c00007800780201")
+        result = parse_notification(raw)
+        assert "last_brush_time" in result
+        assert result["last_brush_pnum"] == 0
+        assert result["last_brush_duration"] == 120
+        assert "last_brush_score" not in result
+
+    def test_0307_real_session_7s(self):
+        """Real 7s session: timestamp, pNum=231, duration=30 s extracted."""
+        raw = bytes.fromhex("03072a422300001a021510191fe7001e001e6400")
+        result = parse_notification(raw)
+        assert "last_brush_time" in result
+        assert result["last_brush_pnum"] == 231
+        assert result["last_brush_duration"] == 30
+        assert "last_brush_score" not in result
+
+    def test_0307_too_short_returns_empty(self):
+        payload = RESP_INFO_T1 + bytes([0xAA, 0xBB, 0xCC])
+        assert parse_notification(payload) == {}
+
+    def test_0307_valid_constructed_record(self):
+        rec = _make_t1_record(year=2026, month=1, day=10, hour=7, minute=30, second=0, pnum=76, duration=120)
+        result = parse_notification(RESP_INFO_T1 + rec)
+        assert result["last_brush_pnum"] == 76
+        assert result["last_brush_duration"] == 120
+        assert "last_brush_score" not in result
+        expected = _expected_t1_ts(2026, 1, 10, 7, 30, 0)
+        assert result["last_brush_time"] == expected
+
+    def test_0307_ocleanx20_extended_offset_inline(self):
+        """OCLEANX20: session_count=0 + year_byte=0 → parse at offset 9 (real log payload)."""
+        import datetime
+
+        raw = bytes.fromhex("03072a422300000000008d1a03090739260300b4")
+        result = parse_notification(raw)
+
+        assert "last_brush_time" in result
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        assert dt.year == 2026
+        assert dt.month == 3
+        assert dt.day == 9
+        assert dt.hour == 7
+        assert dt.minute == 57
+        assert dt.second == 38
+        assert result["last_brush_pnum"] == 3
+        assert result["last_brush_duration"] == 180
+
+    def test_0307_ocleany3p_session_count_gt0_year_byte_0_still_deferred(self):
+        """OCLEANY3P: session_count>0 + year_byte=0 → deferred push, return {}."""
+        # session_count=1 (bytes 3-4 = 0x0001), year_byte=0 (byte 5 = 0x00)
+        payload = bytes.fromhex("2a4223") + bytes([0x00, 0x01, 0x00]) + bytes(12)
+        raw = bytes.fromhex("0307") + payload
+        result = parse_notification(raw)
+        assert result == {}
+
+    def test_0307_and_0308_handled_independently(self):
+        """0307 and 0308 route to different parsers and produce independent results."""
+        t1_raw = bytes.fromhex("03072a422300001a0215102c1c00007800780201")
+        t0_raw = RESP_INFO + _make_record(pressure_raw=300)
+        r_t1 = parse_notification(t1_raw)
+        r_t0 = parse_notification(t0_raw)
+        assert "last_brush_score" not in r_t1
+        assert "last_brush_pressure" in r_t0
+        assert "last_brush_pressure" not in r_t1
+        # 0307 carries pNum and duration; 0308-simple carries pressure
+        assert "last_brush_pnum" in r_t1
+        assert "last_brush_duration" in r_t1
+
+
+# ---------------------------------------------------------------------------
+# Helper: build an extended 32-byte running-data record (AbstractC0002b.m37y)
+# ---------------------------------------------------------------------------
+
+
+def _make_extended_record(
+    *,
+    year: int = 2026,
+    month: int = 2,
+    day: int = 21,
+    hour: int = 20,
+    minute: int = 0,
+    second: int = 0,
+    p_num: int = 7,
+    duration: int = 120,
+    valid_duration: int = 110,
+    pressure_zones: tuple = (50, 50, 50, 50, 50),  # 5 intermediate zone values (bytes 13-17)
+    tz_quarters: int = 4,  # +4 × 15 min = UTC+1
+    area_pressures: tuple = (100, 80, 90, 70, 110, 85, 95, 60),  # 8 tooth area bytes 20-27
+    score: int = 85,
+    scheme_type: int = 2,
+    bus_brushing: int = 0,
+    cross_number: int = 1,
+    extra: bytes = b"",
+) -> bytes:
+    """Build a minimal 32-byte extended running-data record (+ optional extra bytes)."""
+    record_length = 32 + len(extra)
+    buf = bytearray(32)
+    buf[0] = (record_length >> 8) & 0xFF  # high byte of BE uint16 (always 0 for BLE MTU < 256)
+    buf[1] = record_length & 0xFF  # low byte = actual length
+    buf[2] = year - 2000
+    buf[3] = month
+    buf[4] = day
+    buf[5] = hour
+    buf[6] = minute
+    buf[7] = second
+    buf[8] = p_num
+    buf[9] = (duration >> 8) & 0xFF
+    buf[10] = duration & 0xFF
+    buf[11] = (valid_duration >> 8) & 0xFF
+    buf[12] = valid_duration & 0xFF
+    buf[13:18] = bytes(pressure_zones)  # 5 intermediate pressure zone values
+    buf[18] = 0  # RESERVED
+    buf[19] = tz_quarters % 256  # signed stored as unsigned byte
+    buf[20:28] = bytes(area_pressures)  # 8 tooth area pressure values
+    buf[28] = score
+    buf[29] = scheme_type
+    buf[30] = bus_brushing
+    buf[31] = cross_number
+    return bytes(buf) + extra
+
+
+# ---------------------------------------------------------------------------
+# _parse_extended_running_data_record  (new – AbstractC0002b.m37y format)
+# ---------------------------------------------------------------------------
+
+
+class TestParseExtendedRunningDataRecord:
+    # --- Field extraction ---
+
+    def test_score_extracted(self):
+        rec = _make_extended_record(score=85)
+        assert _parse_extended_running_data_record(rec)["last_brush_score"] == 85
+
+    def test_score_zero(self):
+        rec = _make_extended_record(score=0)
+        assert _parse_extended_running_data_record(rec)["last_brush_score"] == 0
+
+    def test_score_clamped_at_100(self):
+        """Scores > 100 (firmware bug?) must be clamped."""
+        rec = _make_extended_record(score=255)
+        assert _parse_extended_running_data_record(rec)["last_brush_score"] == 100
+
+    def test_duration_extracted(self):
+        rec = _make_extended_record(duration=180)
+        assert _parse_extended_running_data_record(rec)["last_brush_duration"] == 180
+
+    def test_duration_be_uint16(self):
+        """Duration is BE uint16: value 300 = 0x012C → bytes [0x01, 0x2C]."""
+        rec = _make_extended_record(duration=300)
+        result = _parse_extended_running_data_record(rec)
+        assert result["last_brush_duration"] == 300
+
+    def test_p_num_extracted(self):
+        rec = _make_extended_record(p_num=42)
+        assert _parse_extended_running_data_record(rec)["last_brush_pnum"] == 42
+
+    # --- Timestamp & timezone ---
+
+    def test_utc_conversion_utcplus1(self):
+        """tz_quarters=4 (UTC+1): device 20:00 → UTC 19:00."""
+        rec = _make_extended_record(
+            year=2026,
+            month=2,
+            day=21,
+            hour=20,
+            minute=0,
+            second=0,
+            tz_quarters=4,
+        )
+        expected = _expected_utc_ts(2026, 2, 21, 20, 0, 0, 4)
+        assert _parse_extended_running_data_record(rec)["last_brush_time"] == expected
+
+    def test_utc_conversion_utcplus8(self):
+        """tz_quarters=32 (UTC+8): device 08:30 → UTC 00:30."""
+        rec = _make_extended_record(
+            year=2026,
+            month=1,
+            day=1,
+            hour=8,
+            minute=30,
+            second=0,
+            tz_quarters=32,
+        )
+        expected = _expected_utc_ts(2026, 1, 1, 8, 30, 0, 32)
+        assert _parse_extended_running_data_record(rec)["last_brush_time"] == expected
+
+    def test_utc_conversion_negative_offset(self):
+        """tz_quarters=236 (= -20, UTC-5): device 12:00 → UTC 17:00."""
+        rec = _make_extended_record(
+            year=2026,
+            month=6,
+            day=15,
+            hour=12,
+            minute=0,
+            second=0,
+            tz_quarters=236,
+        )
+        expected = _expected_utc_ts(2026, 6, 15, 12, 0, 0, 236)
+        assert _parse_extended_running_data_record(rec)["last_brush_time"] == expected
+
+    def test_utc_zero_offset(self):
+        rec = _make_extended_record(tz_quarters=0)
+        expected = _expected_utc_ts(2026, 2, 21, 20, 0, 0, 0)
+        assert _parse_extended_running_data_record(rec)["last_brush_time"] == expected
+
+    # --- Tooth area pressures ---
+
+    def test_area_dict_has_all_8_zone_names(self):
+        rec = _make_extended_record()
+        areas = _parse_extended_running_data_record(rec)["last_brush_areas"]
+        assert set(areas.keys()) == set(TOOTH_AREA_NAMES)
+
+    def test_area_dict_values_match_input(self):
+        pressures = (10, 20, 30, 40, 50, 60, 70, 80)
+        rec = _make_extended_record(area_pressures=pressures)
+        areas = _parse_extended_running_data_record(rec)["last_brush_areas"]
+        for i, name in enumerate(TOOTH_AREA_NAMES):
+            assert areas[name] == pressures[i], f"Zone {name}: expected {pressures[i]}, got {areas[name]}"
+
+    def test_area_dict_zone_order_matches_brushareatype(self):
+        """Verify BrushAreaType enum order: value 1 = upper_left_out at index 0."""
+        pressures = (1, 2, 3, 4, 5, 6, 7, 8)  # each area gets its BrushAreaType value
+        rec = _make_extended_record(area_pressures=pressures)
+        areas = _parse_extended_running_data_record(rec)["last_brush_areas"]
+        assert areas["upper_left_out"] == 1  # AREA_LIFT_UP_OUT   (value 1)
+        assert areas["upper_left_in"] == 2  # AREA_LIFT_UP_IN    (value 2)
+        assert areas["lower_left_out"] == 3  # AREA_LIFT_DOWN_OUT (value 3)
+        assert areas["lower_left_in"] == 4  # AREA_LIFT_DOWN_IN  (value 4)
+        assert areas["upper_right_out"] == 5  # AREA_RIGHT_UP_OUT  (value 5)
+        assert areas["upper_right_in"] == 6  # AREA_RIGHT_UP_IN   (value 6)
+        assert areas["lower_right_out"] == 7  # AREA_RIGHT_DOWN_OUT(value 7)
+        assert areas["lower_right_in"] == 8  # AREA_RIGHT_DOWN_IN (value 8)
+
+    def test_area_all_zones_zero_still_returns_dict(self):
+        """All-zero areas → dict present with 8 zero values."""
+        rec = _make_extended_record(area_pressures=(0, 0, 0, 0, 0, 0, 0, 0))
+        result = _parse_extended_running_data_record(rec)
+        assert "last_brush_areas" in result
+        assert all(v == 0 for v in result["last_brush_areas"].values())
+
+    # --- Average pressure ---
+
+    def test_avg_pressure_calculation(self):
+        """avg_pressure = round(sum(areas) / 8)."""
+        pressures = (100, 80, 90, 70, 110, 85, 95, 60)  # sum=690, avg=86.25 → 86
+        rec = _make_extended_record(area_pressures=pressures)
+        assert _parse_extended_running_data_record(rec)["last_brush_pressure"] == 86
+
+    def test_avg_pressure_all_zero(self):
+        rec = _make_extended_record(area_pressures=(0, 0, 0, 0, 0, 0, 0, 0))
+        assert _parse_extended_running_data_record(rec)["last_brush_pressure"] == 0
+
+    def test_avg_pressure_all_max(self):
+        """255 × 8 / 8 = 255."""
+        rec = _make_extended_record(area_pressures=(255, 255, 255, 255, 255, 255, 255, 255))
+        assert _parse_extended_running_data_record(rec)["last_brush_pressure"] == 255
+
+    # --- Size and edge cases ---
+
+    def test_exactly_32_bytes_accepted(self):
+        rec = _make_extended_record()
+        assert len(rec) == 32
+        result = _parse_extended_running_data_record(rec)
+        assert "last_brush_score" in result
+
+    def test_extra_trailing_bytes_ignored(self):
+        """Records > 32 bytes (pressureProfile suffix) must still parse correctly."""
+        rec = _make_extended_record(extra=bytes([0xAA, 0xBB, 0xCC, 0xDD]))
+        assert len(rec) == 36
+        result = _parse_extended_running_data_record(rec)
+        assert result["last_brush_score"] == 85
+
+    def test_too_short_31_bytes_returns_empty(self):
+        assert _parse_extended_running_data_record(bytes(31)) == {}
+
+    def test_too_short_empty_returns_empty(self):
+        assert _parse_extended_running_data_record(b"") == {}
+
+    def test_invalid_date_returns_empty(self):
+        """Impossible date (month=13) triggers ValueError → {}."""
+        rec = _make_extended_record(month=13)
+        assert _parse_extended_running_data_record(rec) == {}
+
+    def test_invalid_day_zero_returns_empty(self):
+        rec = _make_extended_record(day=0)
+        assert _parse_extended_running_data_record(rec) == {}
+
+    def test_all_expected_keys_present(self):
+        """Verify the full set of keys returned by the extended parser."""
+        rec = _make_extended_record(area_pressures=(50, 50, 50, 50, 50, 50, 50, 50))
+        result = _parse_extended_running_data_record(rec)
+        for key in (
+            "last_brush_time",
+            "last_brush_duration",
+            "last_brush_score",
+            "last_brush_pressure",
+            "last_brush_areas",
+            "last_brush_pnum",
+        ):
+            assert key in result, f"Expected key missing: {key}"
+
+
+# ---------------------------------------------------------------------------
+# _parse_info_response  – format auto-detection (extended vs. simple)
+# ---------------------------------------------------------------------------
+
+
+class TestParseInfoResponseFormatDetection:
+    def test_extended_format_detected_and_parsed(self):
+        """payload[0]==0, payload[1]>=32 → extended format with score/areas/pNum."""
+        payload = _make_extended_record(score=72, p_num=5, duration=90)
+        result = _parse_info_response(payload)
+        assert result["last_brush_score"] == 72
+        assert result["last_brush_pnum"] == 5
+        assert result["last_brush_duration"] == 90
+        assert "last_brush_areas" in result
+
+    def test_simple_format_used_when_byte0_nonzero(self):
+        """year-2000=24 in byte0 → simple format → no score/areas."""
+        payload = _make_record(year=2024, pressure_raw=300)
+        result = _parse_info_response(payload)
+        assert result["last_brush_pressure"] == 1.0
+        assert "last_brush_score" not in result
+        assert "last_brush_areas" not in result
+
+    def test_year_2000_rejected_by_simple_format(self):
+        """byte0==0 (year=2000) fails extended check AND year-validation in simple parser → {}."""
+        payload = _make_record(year=2000, month=3, day=15)
+        # payload[0]=0 (year-2000=0), payload[1]=3 (month) < 32 → extended check fails
+        # Simple parser: year 2000 < 2015 → rejected
+        result = _parse_info_response(payload)
+        assert result == {}
+
+    def test_extended_requires_sufficient_payload_length(self):
+        """payload[1]=32 but payload is only 20 bytes → extended check fails → simple fallback."""
+        # Manually craft a payload that claims to be 32 bytes but is only 20
+        buf = bytearray(20)
+        buf[0] = 0
+        buf[1] = 32  # claims 32 bytes but len=20 → 20 >= 32 is False
+        result = _parse_info_response(bytes(buf))
+        # Falls through to simple format; bytes(20) has year=0→2000, month=0 → invalid → {}
+        assert result == {}
+
+    def test_extended_format_all_zones_zero_parses_correctly(self):
+        """Extended record with all areas=0 still produces score and areas."""
+        payload = _make_extended_record(area_pressures=(0, 0, 0, 0, 0, 0, 0, 0))
+        result = _parse_info_response(payload)
+        assert "last_brush_score" in result
+        assert "last_brush_areas" in result
+
+    def test_end_to_end_via_parse_notification_extended(self):
+        """Full round-trip: parse_notification(0308 + extended_record) → extended fields."""
+        extended = _make_extended_record(score=60, p_num=3, duration=150)
+        result = parse_notification(RESP_INFO + extended)
+        assert result["last_brush_score"] == 60
+        assert result["last_brush_pnum"] == 3
+        assert result["last_brush_duration"] == 150
+        assert "last_brush_areas" in result
+
+    def test_end_to_end_via_parse_notification_simple(self):
+        """Full round-trip: parse_notification(0308 + simple_record) → simple fields."""
+        simple = _make_record(pressure_raw=600)
+        result = parse_notification(RESP_INFO + simple)
+        assert result["last_brush_pressure"] == 2.0
+        assert "last_brush_score" not in result
+
+
+# ---------------------------------------------------------------------------
+# _parse_k3guide_response  (new – 0340 real-time zone guidance)
+# ---------------------------------------------------------------------------
+
+
+class TestParseK3GuideResponse:
+    def test_valid_6_bytes_returns_empty_dict(self):
+        """K3GUIDE is real-time only – must not persist any sensor state."""
+        payload = bytes([100, 80, 90, 70, 3, 1])
+        assert _parse_k3guide_response(payload) == {}
+
+    def test_any_valid_zone_ids_return_empty(self):
+        """Zone IDs 1-8 are all valid; function must not crash and returns {}."""
+        for zone_id in range(1, 9):
+            payload = bytes([50, 50, 50, 50, zone_id, 1])
+            assert _parse_k3guide_response(payload) == {}
+
+    def test_zone_id_255_stop_returns_empty(self):
+        """Zone ID 255 = brushing stopped (AREA_STOP). Must not raise."""
+        payload = bytes([0, 0, 0, 0, 255, 0])
+        assert _parse_k3guide_response(payload) == {}
+
+    def test_zone_id_out_of_range_returns_empty(self):
+        """Zone IDs 0, 9-254 are not defined in BrushAreaType. Must not raise."""
+        for zone_id in (0, 9, 127, 254):
+            payload = bytes([50, 50, 50, 50, zone_id, 1])
+            assert _parse_k3guide_response(payload) == {}
+
+    def test_too_short_5_bytes_returns_empty(self):
+        assert _parse_k3guide_response(bytes(5)) == {}
+
+    def test_too_short_empty_returns_empty(self):
+        assert _parse_k3guide_response(b"") == {}
+
+    def test_exact_6_bytes_minimum_accepted(self):
+        payload = bytes([0, 0, 0, 0, 1, 0])
+        assert _parse_k3guide_response(payload) == {}
+
+    def test_extra_bytes_beyond_6_accepted(self):
+        """Additional bytes (firmware version differences) must not crash."""
+        payload = bytes([100, 80, 90, 70, 3, 1, 0xFF, 0xFF])
+        assert _parse_k3guide_response(payload) == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_notification → K3GUIDE routing (0340)
+# ---------------------------------------------------------------------------
+
+
+class TestParseNotificationK3GuideRouting:
+    def test_0340_prefix_returns_empty(self):
+        """0340 notifications are real-time only and must not return sensor state."""
+        data = RESP_K3GUIDE + bytes([100, 80, 90, 70, 3, 1])
+        assert parse_notification(data) == {}
+
+    def test_0340_prefix_short_payload_returns_empty(self):
+        """0340 with payload < 6 bytes: returns {} without crash."""
+        data = RESP_K3GUIDE + bytes([50, 50])
+        assert parse_notification(data) == {}
+
+    def test_0340_not_confused_with_0308(self):
+        """0340 and 0308 must route to different handlers."""
+        k3guide_data = RESP_K3GUIDE + bytes([100, 80, 90, 70, 3, 1])
+        info_data = RESP_INFO + _make_record(pressure_raw=300)
+        assert parse_notification(k3guide_data) == {}
+        assert "last_brush_pressure" in parse_notification(info_data)
+
+    def test_0340_all_zone_ids_handled(self):
+        """Routing is stable for all valid zone IDs in the K3GUIDE payload."""
+        for zone_id in list(range(1, 9)) + [255]:
+            data = RESP_K3GUIDE + bytes([50, 50, 50, 50, zone_id, 0])
+            assert parse_notification(data) == {}
+
+
+# ---------------------------------------------------------------------------
+# Type-1 score notification (0000)
+# ---------------------------------------------------------------------------
+
+
+class TestParseScoreT1Response:
+    # Observed payload from Oclean X log 2026-02-24: score=95, rest logged only
+    _REAL_PAYLOAD = bytes.fromhex("5f00ffffffffffffff1a0215101a23e7001e")
+
+    def test_real_payload_returns_score_95(self):
+        result = _parse_score_t1_response(self._REAL_PAYLOAD)
+        assert result == {"last_brush_score": 95}
+
+    def test_score_zero_is_valid(self):
+        payload = bytes([0]) + b"\x00" * 17
+        assert _parse_score_t1_response(payload) == {"last_brush_score": 0}
+
+    def test_score_100_is_valid(self):
+        payload = bytes([100]) + b"\x00" * 17
+        assert _parse_score_t1_response(payload) == {"last_brush_score": 100}
+
+    def test_score_clamped_above_100(self):
+        payload = bytes([200]) + b"\x00" * 17
+        assert _parse_score_t1_response(payload)["last_brush_score"] == 100
+
+    def test_score_ff_returns_empty(self):
+        """0xFF means no data."""
+        payload = bytes([0xFF]) + b"\x00" * 17
+        assert _parse_score_t1_response(payload) == {}
+
+    def test_empty_payload_returns_empty(self):
+        assert _parse_score_t1_response(b"") == {}
+
+    def test_single_byte_minimum(self):
+        assert _parse_score_t1_response(bytes([50])) == {"last_brush_score": 50}
+
+    def test_routed_via_parse_notification(self):
+        data = RESP_SCORE_T1 + self._REAL_PAYLOAD
+        result = parse_notification(data)
+        assert result == {"last_brush_score": 95}
+
+    def test_routing_independent_of_rest_bytes(self):
+        """Any 0000-prefixed notification routes to this handler."""
+        data = RESP_SCORE_T1 + bytes([70])
+        assert parse_notification(data) == {"last_brush_score": 70}
+
+
+# ---------------------------------------------------------------------------
+# Type-1 session-metadata notification (5a00) – logging only
+# ---------------------------------------------------------------------------
+
+
+class TestParseSessionMetaT1Response:
+    # Observed payload: Feb 24 2026 00:24:19, duration 150 s
+    _REAL_PAYLOAD = bytes.fromhex("ffffffffffffff1a02180018134c00960096")
+
+    def test_real_payload_returns_timestamp_and_duration(self):
+        result = _parse_session_meta_t1_response(self._REAL_PAYLOAD)
+        assert "last_brush_time" in result
+        assert result["last_brush_duration"] == 150
+        expected_ts = _expected_t1_ts(2026, 2, 24, 0, 24, 19)
+        assert result["last_brush_time"] == expected_ts
+
+    def test_duration_ff_omitted(self):
+        """0xFF duration means no data – should not appear in result."""
+        payload = bytearray(self._REAL_PAYLOAD)
+        payload[15] = 0xFF
+        result = _parse_session_meta_t1_response(bytes(payload))
+        assert "last_brush_duration" not in result
+
+    def test_duration_zero_omitted(self):
+        payload = bytearray(self._REAL_PAYLOAD)
+        payload[15] = 0
+        result = _parse_session_meta_t1_response(bytes(payload))
+        assert "last_brush_duration" not in result
+
+    def test_too_short_returns_empty(self):
+        assert _parse_session_meta_t1_response(b"\xff" * 17) == {}
+
+    def test_empty_returns_empty(self):
+        assert _parse_session_meta_t1_response(b"") == {}
+
+    def test_routed_via_parse_notification(self):
+        data = RESP_SESSION_META_T1 + self._REAL_PAYLOAD
+        result = parse_notification(data)
+        assert "last_brush_time" in result
+        assert result["last_brush_duration"] == 150
+
+
+# ---------------------------------------------------------------------------
+# Type-1 brush-areas notification (2604)
+# ---------------------------------------------------------------------------
+
+
+class TestParseBrushAreasT1Response:
+    # Observed payload from Oclean X log 2026-02-24
+    _REAL_PAYLOAD = bytes.fromhex("390000000f0018181a1a0710071009101007")
+
+    def test_real_payload_returns_areas(self):
+        result = _parse_brush_areas_t1_response(self._REAL_PAYLOAD)
+        assert "last_brush_areas" in result
+        areas = result["last_brush_areas"]
+        assert len(areas) == 8
+        assert areas["upper_left_out"] == 0x18  # 24
+        assert areas["upper_left_in"] == 0x18  # 24
+        assert areas["lower_left_out"] == 0x1A  # 26
+        assert areas["lower_left_in"] == 0x1A  # 26
+        assert areas["upper_right_out"] == 0x07  # 7
+        assert areas["upper_right_in"] == 0x10  # 16
+        assert areas["lower_right_out"] == 0x07  # 7
+        assert areas["lower_right_in"] == 0x10  # 16
+
+    def test_real_payload_pressure(self):
+        result = _parse_brush_areas_t1_response(self._REAL_PAYLOAD)
+        assert "last_brush_pressure" in result
+        assert "last_brush_clean" not in result
+
+    def test_all_zones_zero_areas_present(self):
+        payload = bytes([0x39, 0, 0, 0, 0x0F, 0]) + bytes(8) + bytes(4)
+        result = _parse_brush_areas_t1_response(payload)
+        assert "last_brush_areas" in result
+        assert "last_brush_clean" not in result
+
+    def test_area_names_match_tooth_area_names_order(self):
+        areas = bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        payload = bytes(6) + areas
+        result = _parse_brush_areas_t1_response(payload)
+        for i, name in enumerate(TOOTH_AREA_NAMES):
+            assert result["last_brush_areas"][name] == i + 1
+
+    def test_too_short_13_bytes_returns_empty(self):
+        assert _parse_brush_areas_t1_response(bytes(13)) == {}
+
+    def test_empty_returns_empty(self):
+        assert _parse_brush_areas_t1_response(b"") == {}
+
+    def test_exactly_14_bytes_minimum_accepted(self):
+        result = _parse_brush_areas_t1_response(bytes(14))
+        assert "last_brush_areas" in result
+
+    def test_routed_via_parse_notification(self):
+        data = RESP_BRUSH_AREAS_T1 + self._REAL_PAYLOAD
+        result = parse_notification(data)
+        assert "last_brush_areas" in result
+        assert result["last_brush_areas"]["upper_left_out"] == 24
+
+
+# ---------------------------------------------------------------------------
+# _parse_info_response – extended format detected but parsing fails (lines 198-199)
+# ---------------------------------------------------------------------------
+
+
+class TestParseInfoResponseExtendedFail:
+    """Extended format header detected, but _parse_extended_running_data_record returns {}."""
+
+    def test_extended_format_invalid_date_returns_empty(self):
+        # payload[0]=0, payload[1]=32, len==32 → extended format detected.
+        # data[2] (year_byte) = 0 → year 2000 < _MIN_YEAR → ValueError inside
+        # _parse_extended_running_data_record → returns {} → hits lines 198-199.
+        payload = bytes([0, 32, 0, 1, 1, 0, 0, 0]) + bytes(24)
+        assert len(payload) == 32
+        result = _parse_info_response(payload)
+        assert result == {}
+
+    def test_extended_format_fail_via_parse_notification(self):
+        payload = RESP_INFO + bytes([0, 32, 0, 1, 1, 0, 0, 0]) + bytes(24)
+        result = parse_notification(payload)
+        assert result == {}
+
+    def test_extended_format_not_triggered_for_normal_record(self):
+        # payload[0] != 0 → simple path, not extended
+        payload = _make_record()
+        result = _parse_info_response(payload)
+        assert "last_brush_time" in result
+
+
+# ---------------------------------------------------------------------------
+# _parse_session_meta_t1_response – except path (lines 529-531)
+# ---------------------------------------------------------------------------
+
+
+class TestParseSessionMetaT1ExceptPath:
+    """except branch when _device_datetime raises ValueError on invalid date."""
+
+    def test_zero_year_byte_returns_empty(self):
+        # 7 × 0xFF + year_byte=0 at byte 7 → year 2000 < _MIN_YEAR → ValueError
+        payload = bytes([0xFF] * 7) + bytes([0, 1, 1, 0, 0, 0]) + bytes(5)
+        assert len(payload) == 18
+        result = _parse_session_meta_t1_response(payload)
+        assert result == {}
+
+    def test_invalid_month_returns_empty(self):
+        # year=26 (→ 2026) but month=13 → ValueError from datetime.date
+        payload = bytes([0xFF] * 7) + bytes([26, 13, 1, 0, 0, 0]) + bytes(5)
+        result = _parse_session_meta_t1_response(payload)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _parse_0314_response – always returns {} but logs each byte (lines 574-581)
+# ---------------------------------------------------------------------------
+
+
+class TestParse0314Response:
+    """_parse_0314_response logs every byte and always returns {}."""
+
+    def test_non_empty_payload_returns_empty(self):
+        result = _parse_0314_response(bytes([0x01, 0x02, 0x03]))
+        assert result == {}
+
+    def test_empty_payload_returns_empty(self):
+        result = _parse_0314_response(b"")
+        assert result == {}
+
+    def test_routed_via_parse_notification(self):
+        payload = RESP_EXTENDED_T1 + bytes([0x01, 0x02, 0x03])
+        result = parse_notification(payload)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _parse_brush_areas_y3p_response – short-payload guard (021f / OCLEANY3P)
+# ---------------------------------------------------------------------------
+
+
+class TestParseBrushAreasY3pResponse:
+    def test_short_payload_returns_empty(self):
+        """Payload shorter than 14 bytes must return {} without raising."""
+        assert _parse_brush_areas_y3p_response(bytes(13)) == {}
+        assert _parse_brush_areas_y3p_response(b"") == {}
+
+    def test_routed_via_parse_notification_short(self):
+        """parse_notification with a short 021f payload must return {}."""
+        result = parse_notification(RESP_BRUSH_AREAS_Y3P + bytes(5))
+        assert result == {}
+
+    def test_valid_payload_returns_areas(self):
+        """14+ byte payload must be parsed without raising."""
+        # Observed layout: bytes 0-5 header, bytes 6-13 area pressures
+        payload = bytes([0x00, 0x00, 0x0F, 0x00, 0x0F, 0x21]) + bytes([10, 20, 30, 40, 50, 60, 70, 80])
+        result = _parse_brush_areas_y3p_response(payload)
+        assert "last_brush_areas" in result
+        areas = result["last_brush_areas"]
+        assert len(areas) == 8
+
+
+# ---------------------------------------------------------------------------
+# _parse_session_meta_y3p_response – short-payload guard (5100 / OCLEANY3P)
+# ---------------------------------------------------------------------------
+
+
+class TestParseSessionMetaY3pResponse:
+    def test_short_payload_returns_empty(self):
+        """Payload shorter than 16 bytes must return {} without raising."""
+        assert _parse_session_meta_y3p_response(bytes(15)) == {}
+        assert _parse_session_meta_y3p_response(b"") == {}
+
+    def test_routed_via_parse_notification_short(self):
+        """parse_notification with a short 5100 payload must return {}."""
+        result = parse_notification(RESP_SESSION_META_Y3P + bytes(5))
+        assert result == {}
+
+    def test_invalid_month_triggers_parse_error(self):
+        """month=0 at byte 8 must trigger the ValueError parse-error path."""
+        payload = bytearray(18)
+        payload[8] = 0  # month=0 is invalid
+        payload[9] = 1
+        payload[15] = 120
+        assert _parse_session_meta_y3p_response(bytes(payload)) == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_t1_c3352g_record – C3352g *B# multi-packet record (OCLEANY3 / OCLEANY3P)
+# ---------------------------------------------------------------------------
+
+
+def _make_c3352g_record(
+    *,
+    year: int = 2026,
+    month: int = 3,
+    day: int = 9,
+    hour: int = 7,
+    minute: int = 0,
+    second: int = 0,
+    pnum: int = 42,
+    duration: int = 120,
+    score: int = 82,
+) -> bytes:
+    """Build a full 42-byte C3352g session record (year_base at byte 0)."""
+    record = bytearray(42)
+    record[0] = year - 2000  # year_base byte (year − 2000)
+    record[1] = month
+    record[2] = day
+    record[3] = hour
+    record[4] = minute
+    record[5] = second
+    record[6] = pnum
+    record[7] = (duration >> 8) & 0xFF
+    record[8] = duration & 0xFF
+    record[33] = score
+    return bytes(record)
+
+
+class TestParseT1C3352gRecord:
+    """Tests for parse_t1_c3352g_record (C3352g *B# multi-packet, OCLEANY3/OCLEANY3P)."""
+
+    def test_constant_is_42(self):
+        assert T1_C3352G_RECORD_SIZE == 42
+
+    def test_extracts_timestamp(self):
+        record = _make_c3352g_record(year=2026, month=3, day=9, hour=7, minute=0, second=0)
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_time" in result
+        expected = _expected_t1_ts(2026, 3, 9, 7, 0, 0)
+        assert result["last_brush_time"] == expected
+
+    def test_extracts_pnum_duration_score(self):
+        record = _make_c3352g_record(pnum=55, duration=150, score=75)
+        result = parse_t1_c3352g_record(record)
+        assert result["last_brush_pnum"] == 55
+        assert result["last_brush_duration"] == 150
+        assert result["last_brush_score"] == 75
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+
+    def test_score_0xff_not_stored(self):
+        record = _make_c3352g_record(score=0xFF)
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_0_not_stored(self):
+        record = _make_c3352g_record(score=0)
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_101_not_stored(self):
+        record = _make_c3352g_record(score=101)
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_score" not in result
+
+    def test_areas_never_stored(self):
+        """C3352g record bytes are pressureRatio/gestureCode data, not zone areas."""
+        record = _make_c3352g_record()
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+
+    def test_zero_duration_not_stored(self):
+        record = _make_c3352g_record(duration=0)
+        result = parse_t1_c3352g_record(record)
+        assert "last_brush_duration" not in result
+
+    def test_too_short_returns_empty(self):
+        assert parse_t1_c3352g_record(bytes(41)) == {}
+        assert parse_t1_c3352g_record(b"") == {}
+
+    def test_year_base_zero_returns_empty(self):
+        """year_base=0 → year 2000 < _MIN_YEAR → record rejected (OCLEANY3P placeholder)."""
+        record = bytearray(_make_c3352g_record())
+        record[0] = 0x00  # year 2000
+        assert parse_t1_c3352g_record(bytes(record)) == {}
+
+    def test_invalid_month_triggers_parse_error_path(self):
+        """month=0 → datetime.datetime raises ValueError → parse error path returns {}."""
+        record = bytearray(_make_c3352g_record())
+        record[1] = 0  # month=0 is invalid for datetime
+        assert parse_t1_c3352g_record(bytes(record)) == {}
+
+    def test_gesture_code_from_byte30_bits(self):
+        """gestureCode is a 2-bit value from byte 30 position 2 (APK: a.b.a(byte30, 2))."""
+        record = bytearray(_make_c3352g_record())
+        # gestureCode = bits 3-2 of byte 30: value 2 → byte 30 = 0b0000_10_00 = 0x08
+        record[30] = 0x08
+        result = parse_t1_c3352g_record(bytes(record))
+        assert result["last_brush_gesture_code"] == 2
+        # value 3 → byte 30 = 0b0000_11_00 = 0x0C
+        record[30] = 0x0C
+        result = parse_t1_c3352g_record(bytes(record))
+        assert result["last_brush_gesture_code"] == 3
+
+    def test_gesture_array_8_elements_from_byte23(self):
+        """gestureArray is 8 bytes (23-30) padded to 12 (APK: m18f bytes 23-30)."""
+        record = bytearray(_make_c3352g_record())
+        for i in range(8):
+            record[23 + i] = i + 1
+        result = parse_t1_c3352g_record(bytes(record))
+        assert result["last_brush_gesture_array"] == [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0]
+
+    def test_pressure_ratio_from_bytes11_to_15(self):
+        """pressureRatio comes from bytes 11-15 (confirmed APK)."""
+        record = bytearray(_make_c3352g_record())
+        record[11] = 0
+        record[12] = 1
+        record[13] = 4
+        record[14] = 30
+        record[15] = 0
+        result = parse_t1_c3352g_record(bytes(record))
+        assert result["last_brush_pressure_ratio"] == [0, 1, 4, 30, 0]
+
+    def test_year_extracted_from_byte0(self):
+        """Year comes from byte 0 (+ 2000), not from wall-clock inference."""
+        record = _make_c3352g_record(year=2024, month=6, day=15, hour=9, minute=0, second=0)
+        result = parse_t1_c3352g_record(record)
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        assert dt.year == 2024
+        assert dt.month == 6
+        assert dt.day == 15
+
+    def test_real_observed_bytes(self):
+        """Decode a real 42-byte *B# record from OCLEANY3P (issue #49, 2026-03-22).
+
+        Raw record (from *B# reassembly log):
+          1a03161722234c009600960001041e00000f00141f171a050e0f0d080f0c0e00006200ffffffffffffff
+        Confirmed field values:
+          ts  = 2026-03-22 23:34:35  (bytes 0-5)
+          pNum = 76                  (byte 6 = 0x4c)
+          duration = 150 s           (bytes 7-8 = 0x0096)
+          gestureCode = 20           (byte 19 = 0x14, APK-confirmed)
+          score = 98                 (byte 33 = 0x62)
+          pressureRatio = [0,1,4,30,0]  (bytes 11-15)
+          NO last_brush_areas        (bytes 11-19 are not zone data)
+        """
+        raw = bytes.fromhex("1a03161722234c009600960001041e00000f00141f171a050e0f0d080f0c0e00006200ffffffffffffff")
+        assert len(raw) == 42
+        result = parse_t1_c3352g_record(raw)
+        assert result["last_brush_score"] == 98
+        assert result["last_brush_duration"] == 150
+        assert result["last_brush_pnum"] == 76
+        assert result["last_brush_gesture_code"] == 3  # byte 30 = 0x0e, bits 3-2 = 3
+        assert result["last_brush_pressure_ratio"] == [0, 1, 4, 30, 0]
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        assert dt.year == 2026
+        assert dt.month == 3
+        assert dt.day == 22
+
+
+# ---------------------------------------------------------------------------
+# parse_t1_c3385w0_record – C3385w0 *B# multi-packet record (OCLEANY3M / OCLEANY3)
+# ---------------------------------------------------------------------------
+
+
+def _make_c3385w0_record(
+    *,
+    year: int = 2026,
+    month: int = 3,
+    day: int = 11,
+    hour: int = 20,
+    minute: int = 2,
+    second: int = 23,
+    pnum: int = 0,
+    duration: int = 120,
+    score: int = 91,
+    areas: tuple = (5, 20, 75, 0, 0),
+) -> bytes:
+    """Build a full 42-byte C3385w0 session record with tooth-zone area data.
+
+    Only areas 1-5 (bytes 11-15) are stored in the *B# record per APK analysis.
+    Byte 16 is discarded by the APK; bytes 18-19 are gestureArray[0-1], not areas.
+    Areas 6-8 arrive via the 2604 enrichment push and are not part of this record.
+    """
+    record = bytearray(42)
+    record[0] = year - 2000
+    record[1] = month
+    record[2] = day
+    record[3] = hour
+    record[4] = minute
+    record[5] = second
+    record[6] = pnum
+    record[7] = (duration >> 8) & 0xFF
+    record[8] = duration & 0xFF
+    # Area bytes 11-15: area1-5 only (APK-confirmed)
+    for i, v in enumerate(areas[:5]):
+        record[11 + i] = v
+    record[33] = score
+    return bytes(record)
+
+
+class TestParseT1C3385w0Record:
+    """Tests for parse_t1_c3385w0_record (C3385w0 *B# multi-packet, OCLEANY3M/OCLEANY3)."""
+
+    def test_extracts_timestamp(self):
+        record = _make_c3385w0_record(year=2026, month=3, day=11, hour=20, minute=2, second=23)
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_time" in result
+        expected = _expected_t1_ts(2026, 3, 11, 20, 2, 23)
+        assert result["last_brush_time"] == expected
+
+    def test_extracts_pnum_duration_score(self):
+        record = _make_c3385w0_record(pnum=5, duration=90, score=85)
+        result = parse_t1_c3385w0_record(record)
+        assert result["last_brush_pnum"] == 5
+        assert result["last_brush_duration"] == 90
+        assert result["last_brush_score"] == 85
+
+    def test_areas_absent_when_all_zero(self):
+        """DATA_LAST_BRUSH_AREAS is not stored when all 5 area bytes are zero."""
+        record = _make_c3385w0_record(areas=(0, 0, 0, 0, 0))
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_areas" not in result
+
+    def test_areas_present_when_nonzero(self):
+        """Bytes 11-15 (area1-5) are stored as a partial 8-key areas dict."""
+        record = _make_c3385w0_record(areas=(5, 20, 75, 0, 0))
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_areas" in result
+        areas = result["last_brush_areas"]
+        assert len(areas) == 8
+        assert list(areas.values())[:5] == [5, 20, 75, 0, 0]
+        assert list(areas.values())[5:] == [0, 0, 0]
+
+    def test_pressure_ratio_always_stored(self):
+        """DATA_LAST_BRUSH_PRESSURE_RATIO is stored regardless of area values."""
+        record = _make_c3385w0_record(areas=(0, 0, 0, 0, 0))
+        result = parse_t1_c3385w0_record(record)
+        assert result["last_brush_pressure_ratio"] == [0, 0, 0, 0, 0]
+
+    def test_score_0xff_not_stored(self):
+        record = _make_c3385w0_record(score=0xFF)
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_0_not_stored(self):
+        record = _make_c3385w0_record(score=0)
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_score" not in result
+
+    def test_zero_duration_not_stored(self):
+        record = _make_c3385w0_record(duration=0)
+        result = parse_t1_c3385w0_record(record)
+        assert "last_brush_duration" not in result
+
+    def test_too_short_returns_empty(self):
+        assert parse_t1_c3385w0_record(bytes(41)) == {}
+        assert parse_t1_c3385w0_record(b"") == {}
+
+    def test_year_base_zero_returns_empty(self):
+        record = bytearray(_make_c3385w0_record())
+        record[0] = 0x00
+        assert parse_t1_c3385w0_record(bytes(record)) == {}
+
+    def test_real_observed_bytes_from_ocleany3mh(self):
+        """Decode a real 42-byte *B# record from OCLEANY3MH (integration test reference).
+
+        Source: logs/20260311_#19_NicGray78_v2.log (session at 2026-03-11 20:02:23)
+        Packet bytes reassembled from:
+          03072a422300011a030b14021700007800780514  (header, inline bytes 0-12)
+          4b0000001f00000000001c14190c0a0a0a000000  (continuation bytes 13-32)
+          5b030301ffffffffff1a0306071e0f0000780078  (continuation bytes 33-41+)
+        """
+        # Full 42-byte record extracted from above packets (bytes 0-41)
+        # year_base=0x1a(26→2026), month=3, day=0xb(11), hour=0x14(20), min=2, sec=0x17(23)
+        raw = bytes.fromhex(
+            "1a030b14021700007800780514"  # bytes 0-12  (header inline)
+            "4b0000001f00000000001c14190c0a0a0a000000"  # bytes 13-32 (cont1)
+            "5b030301ffffffff1a"  # bytes 33-41 (first 9 bytes of cont2; byte33=0x5b=91=score)
+        )
+        assert len(raw) == 42
+        result = parse_t1_c3385w0_record(raw)
+        assert result["last_brush_score"] == 91
+        assert result["last_brush_duration"] == 120
+        assert result["last_brush_pnum"] == 0
+        # bytes 11-15 = [0x05, 0x14, 0x4b, 0x00, 0x00] = [5, 20, 75, 0, 0] → areas stored
+        assert "last_brush_areas" in result
+        assert result["last_brush_pressure_ratio"] == [5, 20, 75, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# parse_y3p_stream_record – OCLEANY3P *B# stream records (year inferred)
+# ---------------------------------------------------------------------------
+
+
+def _make_y3p_record(
+    *,
+    month: int = 3,
+    day: int = 9,
+    hour: int = 7,
+    minute: int = 0,
+    second: int = 0,
+    duration: int = 120,
+    gesture_array: tuple = (0, 0, 0, 0, 0, 0, 0, 0),
+    score: int = 82,
+    pressure_ratio: tuple = (0, 0, 0, 0, 0),
+) -> bytes:
+    """Build a full 42-byte OCLEANY3P stream record (year_base=0x00 at byte 0)."""
+    record = bytearray(42)
+    record[0] = 0x00  # year_base always 0x00 for OCLEANY3P
+    record[1] = month
+    record[2] = day
+    record[3] = hour
+    record[4] = minute
+    record[5] = second
+    record[7] = (duration >> 8) & 0xFF
+    record[8] = duration & 0xFF
+    for i, v in enumerate(pressure_ratio[:5]):
+        record[11 + i] = v
+    for i, v in enumerate(gesture_array[:8]):
+        record[23 + i] = v  # gestureArray at bytes 23-30
+    record[33] = score
+    return bytes(record)
+
+
+class TestParseY3pStreamRecord:
+    """Tests for parse_y3p_stream_record (OCLEANY3P *B# stream, year inferred)."""
+
+    def test_extracts_timestamp_current_year(self):
+        """Date in the past resolves to the current year."""
+        now = datetime.datetime.now()
+        record = _make_y3p_record(month=now.month, day=max(1, now.day - 1))
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_time" in result
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        assert dt.year == now.year
+
+    def test_future_date_steps_back_one_year(self):
+        """A date one month in the future rolls back to the previous year."""
+        now = datetime.datetime.now()
+        future_month = (now.month % 12) + 1
+        record = _make_y3p_record(month=future_month, day=1, hour=0, minute=0, second=0)
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_time" in result
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        # The inferred year must be in the past (either current or previous year)
+        assert dt <= now
+
+    def test_extracts_duration(self):
+        record = _make_y3p_record(duration=180)
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_duration") == 180
+
+    def test_zero_duration_not_stored(self):
+        record = _make_y3p_record(duration=0)
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_duration" not in result
+
+    def test_extracts_score(self):
+        record = _make_y3p_record(score=75)
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_score") == 75
+
+    def test_score_0_not_stored(self):
+        record = _make_y3p_record(score=0)
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_101_not_stored(self):
+        record = _make_y3p_record(score=101)
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_score" not in result
+
+    def test_score_0xff_not_stored(self):
+        record = _make_y3p_record(score=0xFF)
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_score" not in result
+
+    def test_areas_from_embedded_021f_in_stream(self):
+        """Areas extracted when 021f is embedded as first continuation (record[13:15] == 02 1f).
+
+        When the device sends 021f as the first *B# continuation packet,
+        bytes 13-14 of the reassembled record = 0x02 0x1f (021f prefix) and
+        area pressures land at bytes 21-28.
+        """
+        record = bytearray(42)
+        record[0] = 0x00
+        record[1] = 6; record[2] = 9; record[3] = 8; record[4] = 17; record[5] = 54
+        record[8] = 162  # duration
+        record[11] = 0; record[12] = 2; record[13] = 7; record[14] = 27  # pressure_ratio
+        # Embed 021f at bytes 13-32:
+        record[13] = 0x02  # 021f prefix byte 0
+        record[14] = 0x1f  # 021f prefix byte 1
+        # bytes 15-20: 021f header (6 bytes)
+        # bytes 21-28: 8 area pressures
+        record[21] = 17; record[22] = 35; record[23] = 1; record[24] = 13
+        record[25] = 18; record[26] = 15; record[27] = 1; record[28] = 15
+        record[33] = 91  # score
+        result = parse_y3p_stream_record(bytes(record))
+        assert isinstance(result.get("last_brush_areas"), dict)
+        assert len(result["last_brush_areas"]) == 8
+        assert result.get("last_brush_pressure") is not None
+
+    def test_areas_from_gesture_array_when_no_embedded_021f(self):
+        """gestureArray (bytes 23-30) used as area fallback when 021f is not embedded."""
+        record = _make_y3p_record(gesture_array=(3, 5, 19, 16, 2, 17, 16, 18))
+        result = parse_y3p_stream_record(record)
+        assert isinstance(result.get("last_brush_areas"), dict)
+        assert len(result["last_brush_areas"]) == 8
+        assert result.get("last_brush_pressure") is not None
+        assert result.get("last_brush_coverage") == 100
+
+    def test_no_areas_when_gesture_array_all_zero(self):
+        """No areas when gestureArray is all zeros and no embedded 021f."""
+        record = _make_y3p_record(gesture_array=(0, 0, 0, 0, 0, 0, 0, 0))
+        result = parse_y3p_stream_record(record)
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+
+    def test_coverage_prefers_gesture_area_values(self):
+        """Y3P coverage is computed from per-zone gesture/021f data when present."""
+        # All 8 zones touched, even though only 3 of 5 pressure-ratio buckets are active.
+        record = _make_y3p_record(
+            pressure_ratio=(0, 6, 5, 27, 0),
+            gesture_array=(3, 5, 19, 16, 2, 17, 16, 18),
+        )
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_coverage") == 100
+
+    def test_coverage_partial_from_gesture_area_values(self):
+        """Zero gesture/area values count as not covered on the Y3P low-range scale."""
+        record = _make_y3p_record(
+            pressure_ratio=(10, 20, 30, 40, 50),
+            gesture_array=(3, 0, 19, 0, 2, 17, 0, 18),
+        )
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_coverage") == 62  # 5/8 zones touched
+
+    def test_coverage_falls_back_to_pressure_ratio_when_no_areas(self):
+        """pressure_ratio remains a fallback when no 021f/gestureArray data exists."""
+        record = _make_y3p_record(pressure_ratio=(0, 6, 5, 27, 0))
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_coverage") == 60
+
+    def test_coverage_zero_when_all_ratio_zero_and_no_areas(self):
+        record = _make_y3p_record(pressure_ratio=(0, 0, 0, 0, 0))
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_coverage") == 0
+
+    def test_too_short_returns_empty(self):
+        assert parse_y3p_stream_record(bytes(41)) == {}
+        assert parse_y3p_stream_record(b"") == {}
+
+    def test_invalid_month_returns_empty(self):
+        """month=0 → datetime.datetime raises ValueError → returns {}."""
+        record = bytearray(_make_y3p_record())
+        record[1] = 0
+        assert parse_y3p_stream_record(bytes(record)) == {}
+
+    def test_real_observed_bytes(self):
+        """Decode a realistic 42-byte Y3P record from issue #49 log analysis.
+
+        Session observed 2025-08-28 00:59:55: byte 0 = 0x00, bytes 1-5 = 8/28/0/59/55,
+        bytes 7-8 = 0x00/0x78 (120 s preset), bytes 9-10 = 0 (validDuration not set → fallback
+        to preset), score at byte 33. bytes 13-14 are 0x05/0x0e (not 021f) → no areas.
+        """
+        record = bytearray(42)
+        record[0] = 0x00  # no year encoded
+        record[1] = 8  # month
+        record[2] = 28  # day
+        record[3] = 0  # hour
+        record[4] = 59  # minute
+        record[5] = 55  # second
+        record[7] = 0x00
+        record[8] = 0x78  # duration = 120 s (preset; validDuration bytes 9-10 left at 0)
+        record[13] = 5   # binary continuation data (not 021f)
+        record[14] = 14
+        record[33] = 82  # score
+        result = parse_y3p_stream_record(bytes(record))
+        assert result.get("last_brush_duration") == 120
+        assert result.get("last_brush_score") == 82
+        assert "last_brush_areas" not in result  # no embedded 021f
+        dt = datetime.datetime.fromtimestamp(result["last_brush_time"])
+        assert dt.month == 8
+        assert dt.day == 28
+        assert dt.hour == 0
+        assert dt.minute == 59
+        assert dt.second == 55
+
+
+    def test_nonzero_year_byte_still_parses(self):
+        """year_base != 0 is ignored; month/day/... are still read correctly.
+
+        Reproduces the real OCLEANY3P inline *B# case from logs (2026-06-03).
+        Raw record: 1a0603080b010000b400970001021f00001000191e0a2306120b100405131000006100ffffffffffffff
+
+        bytes 7-8 = 0x00b4 = 180 s (preset/goal), bytes 9-10 = 0x0097 = 151 s (validDuration =
+        actual brushing time). Parser uses validDuration when > 0.
+        bytes 13-14 = 0x02 0x1f → embedded 021f → areas at bytes 21-28.
+        """
+        record = bytes.fromhex("1a0603080b010000b400970001021f00001000191e0a2306120b100405131000006100ffffffffffffff")
+        assert len(record) == 42
+        result = parse_y3p_stream_record(record)
+        assert result.get("last_brush_duration") == 151  # validDuration (bytes 9-10), not preset 180
+        assert result.get("last_brush_score") == 97
+        assert result.get("last_brush_pnum") == 0
+        # bytes 13-14 = 02 1f → 021f embedded → areas at bytes 21-28
+        assert isinstance(result.get("last_brush_areas"), dict)
+
+
+# ---------------------------------------------------------------------------
+# _parse_t1_ocleanx20_inline – OCLEANX20 extended-offset inline format
+# ---------------------------------------------------------------------------
+
+
+class TestParseT1OcleanX20Inline:
+    """Tests for _parse_t1_ocleanx20_inline (extended-offset 0307 path, issue #37)."""
+
+    def test_short_payload_returns_empty(self):
+        """Payload shorter than 18 bytes must return {} immediately."""
+        assert _parse_t1_ocleanx20_inline(b"") == {}
+        assert _parse_t1_ocleanx20_inline(bytes(17)) == {}
+
+    def test_valid_payload_extracts_timestamp_and_pnum(self):
+        """Real-log payload (issue #37): session record at offset 9."""
+        # "03072a422300000000008d1a03090739260300b4" stripped of 0307 prefix
+        payload = bytes.fromhex("2a422300000000008d1a03090739260300b4")
+        result = _parse_t1_ocleanx20_inline(payload)
+        assert "last_brush_time" in result
+        assert result["last_brush_pnum"] == 3
+        assert result.get("last_brush_duration") == 180
+
+    def test_zero_duration_not_stored(self):
+        """duration==0 must not appear in the result dict."""
+        payload = bytearray(18)
+        # bytes 9-14: year/m/d/h/min/s (2026-01-01 00:00:00)
+        payload[9] = 26
+        payload[10] = 1
+        payload[11] = 1
+        # bytes 16-17: duration = 0x0000
+        result = _parse_t1_ocleanx20_inline(bytes(payload))
+        assert "last_brush_duration" not in result
+
+    def test_parse_error_returns_empty(self):
+        """An IndexError/OverflowError inside the try block must return {}."""
+        # Craft a payload with an invalid year that causes _device_datetime to fail.
+        # _device_datetime raises ValueError for month=0.
+        payload = bytearray(18)
+        payload[9] = 0  # year_base=0 → 2000
+        payload[10] = 0  # month=0 → invalid
+        payload[11] = 0  # day=0 → invalid
+        result = _parse_t1_ocleanx20_inline(bytes(payload))
+        assert result == {}
+
+
+
+# ---------------------------------------------------------------------------
+# OCLEANV1a / Oclean X Ultra – inline-only 0307 regression coverage (issue #81)
+# ---------------------------------------------------------------------------
+
+
+class TestParseNotificationInfoT1OcleanV1aRouting:
+    """Regression tests for OCLEANV1a inline-only 0307 payloads.
+
+    Real logs show that OCLEANV1a currently follows the same extended-offset inline
+    0307 path as OCLEANX20: session_count == 0, year_byte == 0 at byte 5, and the
+    actual session record starts at offset 9. The parser must reliably extract
+    timestamp / pNum / duration while leaving score / areas / pressure absent when
+    no enrichment packets (2604 / 021f / 0308 / 0000) arrive.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw_hex", "expected"),
+        [
+            (
+                "03072a422300000000006f1a0410162516010078",
+                (2026, 4, 16, 22, 37, 22),
+            ),
+            (
+                "03072a422300000000004c1a040f172920010078",
+                (2026, 4, 15, 23, 41, 32),
+            ),
+        ],
+    )
+    def test_real_ocleanv1a_inline_payloads_parse_core_fields_only(self, raw_hex: str, expected: tuple[int, int, int, int, int, int]):
+        raw = bytes.fromhex(raw_hex)
+        result = parse_notification(raw)
+
+        assert result["last_brush_time"] == _expected_t1_ts(*expected)
+        assert result["last_brush_pnum"] == 1
+        assert result["last_brush_duration"] == 120
+
+        assert "last_brush_score" not in result
+        assert "last_brush_areas" not in result
+        assert "last_brush_pressure" not in result
+        assert "last_brush_coverage" not in result
+
+
+# ---------------------------------------------------------------------------
+# _log_4b00_response – byte-by-byte logger for 4b00 (OCLEANY3MH)
+# ---------------------------------------------------------------------------
+
+
+class TestLog4b00Response:
+    """Tests for _log_4b00_response (RESP_UNKNOWN_4B00 parser)."""
+
+    def test_empty_payload_returns_empty(self):
+        assert _log_4b00_response(b"") == {}
+
+    def test_non_empty_payload_returns_empty(self):
+        """Any payload must be consumed and {} returned (pure logging)."""
+        result = _log_4b00_response(bytes(range(16)))
+        assert result == {}
+
+    def test_routed_via_parse_notification(self):
+        """parse_notification must route 4b00 prefix to _log_4b00_response."""
+        from custom_components.oclean_ble.const import RESP_UNKNOWN_4B00
+
+        result = parse_notification(RESP_UNKNOWN_4B00 + bytes(16))
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# XX03 score+session record parser (OCLEANY3MH, issue #19)
+# ---------------------------------------------------------------------------
+
+
+def _make_xx03_record(
+    *,
+    score: int = 58,
+    byte3: int = 0x03,
+    year: int = 2026,
+    month: int = 3,
+    day: int = 3,
+    hour: int = 19,
+    minute: int = 50,
+    second: int = 7,
+    pnum: int = 87,
+    duration: int = 180,
+) -> bytes:
+    """Build a 20-byte XX03 session record matching the confirmed OCLEANY3MH format.
+
+    Confirmed layout (empirical logs, issue #19):
+      byte  0: score
+      bytes 1-2: 0x03 0x03 (constant)
+      byte  3: varies (0x03 older sessions, 0x00 recent)
+      bytes 4-8: ff×5 (separator)
+      byte  9: year_base (+2000)
+      byte 10: month
+      byte 11: day
+      byte 12: hour
+      byte 13: minute
+      byte 14: second
+      byte 15: pNum
+      bytes 16-17: duration BE
+      bytes 18-19: validDuration BE (same value as duration)
+    """
+    data = bytearray(20)
+    data[0] = score
+    data[1] = 0x03
+    data[2] = 0x03
+    data[3] = byte3
+    data[4:9] = b"\xff" * 5
+    data[9] = year - 2000
+    data[10] = month
+    data[11] = day
+    data[12] = hour
+    data[13] = minute
+    data[14] = second
+    data[15] = pnum
+    data[16] = (duration >> 8) & 0xFF
+    data[17] = duration & 0xFF
+    data[18] = (duration >> 8) & 0xFF
+    data[19] = duration & 0xFF
+    return bytes(data)
+
+
+class TestParseXx03SessionRecord:
+    """Tests for _parse_xx03_session_record (OCLEANY3MH score+session, issue #19)."""
+
+    def test_real_observed_packet_old(self):
+        """Decode the confirmed real notification from the 2026-03-10 log.
+
+        Raw: 3a030303ffffffffff1a03031332075700b400b4
+        score=0x3A=58 confirmed against Oclean app.
+        """
+        raw = bytes.fromhex("3a030303ffffffffff1a03031332075700b400b4")
+        result = parse_notification(raw)
+        assert result.get(DATA_LAST_BRUSH_SCORE) == 58
+        assert result.get(DATA_LAST_BRUSH_PNUM) == 87
+        assert result.get(DATA_LAST_BRUSH_DURATION) == 180
+        dt = datetime.datetime.fromtimestamp(result[DATA_LAST_BRUSH_TIME])
+        assert dt.year == 2026
+        assert dt.month == 3
+        assert dt.day == 3
+        assert dt.hour == 19
+        assert dt.minute == 50
+
+    def test_real_observed_packet_new_byte3_zero(self):
+        """Decode the 2026-03-11 log notification (byte[3]=0x00 variant).
+
+        Raw: 47030300ffffffffff1a0306071e0f0000780078
+        score=0x47=71, session 2026-03-06 07:30:15.
+        """
+        raw = bytes.fromhex("47030300ffffffffff1a0306071e0f0000780078")
+        result = parse_notification(raw)
+        assert result.get(DATA_LAST_BRUSH_SCORE) == 0x47  # 71
+        assert result.get(DATA_LAST_BRUSH_DURATION) == 120
+        dt = datetime.datetime.fromtimestamp(result[DATA_LAST_BRUSH_TIME])
+        assert dt.year == 2026
+        assert dt.month == 3
+        assert dt.day == 6
+
+    def test_score_extracted_from_byte0(self):
+        record = _make_xx03_record(score=75)
+        result = parse_notification(record)
+        assert result.get(DATA_LAST_BRUSH_SCORE) == 75
+
+    def test_score_zero_not_stored(self):
+        record = _make_xx03_record(score=0)
+        result = parse_notification(record)
+        assert DATA_LAST_BRUSH_SCORE not in result
+
+    def test_score_101_not_stored(self):
+        record = _make_xx03_record(score=101)
+        result = parse_notification(record)
+        assert DATA_LAST_BRUSH_SCORE not in result
+
+    def test_timestamp_extracted(self):
+        record = _make_xx03_record(year=2026, month=3, day=3, hour=19, minute=50, second=7)
+        result = parse_notification(record)
+        dt = datetime.datetime.fromtimestamp(result[DATA_LAST_BRUSH_TIME])
+        assert dt.year == 2026
+        assert dt.month == 3
+        assert dt.day == 3
+
+    def test_too_short_falls_through(self):
+        """Fewer than 20 bytes must not trigger the XX03 path."""
+        data = bytearray(19)
+        data[0] = 58
+        data[1] = 0x03
+        data[2] = 0x03
+        data[4:9] = b"\xff" * 5
+        result = parse_notification(bytes(data))
+        assert result == {}
+
+    def test_wrong_ff_separator_falls_through(self):
+        """If bytes 4-8 are not ff×5 the XX03 path must not trigger."""
+        data = bytearray(_make_xx03_record())
+        data[6] = 0x00  # break one ff byte
+        result = parse_notification(bytes(data))
+        assert result == {}
+
+    def test_byte3_zero_variant_parses(self):
+        """byte[3]=0x00 (recent session variant) must also be parsed."""
+        record = _make_xx03_record(score=71, byte3=0x00)
+        result = parse_notification(record)
+        assert result.get(DATA_LAST_BRUSH_SCORE) == 71
+
+    def test_year_base_zero_returns_empty(self):
+        """year_base=0 → year 2000 < _MIN_YEAR → reject."""
+        data = bytearray(_make_xx03_record())
+        data[9] = 0x00
+        result = parse_notification(bytes(data))
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _parse_device_settings_response (0302)
+# ---------------------------------------------------------------------------
+
+
+class TestLogDeviceSettingsResponse:
+    """Tests for _parse_device_settings_response (RESP_DEVICE_SETTINGS / 0302 parser)."""
+
+    def _make_payload(self, head_days: int = 42, head_times: int = 17) -> bytes:
+        """Build a minimal 32-byte 0302 payload with known brush-head values."""
+        payload = bytearray(32)
+        # bytes 29-31: headUsedDays (2-byte BE)
+        payload[29] = (head_days >> 8) & 0xFF
+        payload[30] = head_days & 0xFF
+        # byte 31: headUsedTimes
+        payload[31] = head_times
+        return bytes(payload)
+
+    def test_returns_brush_head_usage_and_days(self):
+        """32-byte payload must return DATA_BRUSH_HEAD_USAGE and DATA_BRUSH_HEAD_DAYS."""
+        result = _parse_device_settings_response(self._make_payload(head_days=42, head_times=17))
+        assert result[DATA_BRUSH_HEAD_USAGE] == 17
+        assert result[DATA_BRUSH_HEAD_DAYS] == 42
+
+    def test_short_payload_no_brush_head_counters(self):
+        """Payloads shorter than 32 bytes return modeNum but not brush-head counters."""
+        result = _parse_device_settings_response(bytes(31))
+        assert DATA_BRUSH_MODE in result
+        assert DATA_BRUSH_HEAD_USAGE not in result
+        assert DATA_BRUSH_HEAD_DAYS not in result
+        assert _parse_device_settings_response(b"") == {}
+
+    def test_routed_via_parse_notification(self):
+        """parse_notification must route 0302 prefix to _parse_device_settings_response."""
+        payload = self._make_payload(head_days=10, head_times=5)
+        data = RESP_DEVICE_SETTINGS + payload
+        result = parse_notification(data)
+        assert result[DATA_BRUSH_HEAD_USAGE] == 5
+        assert result[DATA_BRUSH_HEAD_DAYS] == 10
+
+
+def _make_device_settings_payload(mode_num: int = 0, extra_bytes: int = 28) -> bytes:
+    """Build a minimal 0302 payload.
+
+    Byte layout (APK C3367n0.java):
+      0  batteryLevel
+      1  networkStatus
+      2  raiseWake
+      3  voiceMainSwitch
+      4  bindState
+      5  modeNum  ← the field under test
+      6+ remaining bytes (irrelevant for current parser)
+    """
+    payload = bytearray(6 + extra_bytes)
+    payload[5] = mode_num
+    return bytes(payload)
+
+
+class TestParseDeviceSettingsResponse:
+    def test_mode_num_extracted(self):
+        payload = _make_device_settings_payload(mode_num=2)
+        result = _parse_device_settings_response(payload)
+        assert result[DATA_BRUSH_MODE] == 2
+
+    def test_mode_num_zero(self):
+        payload = _make_device_settings_payload(mode_num=0)
+        assert _parse_device_settings_response(payload)[DATA_BRUSH_MODE] == 0
+
+    def test_mode_num_max_byte(self):
+        payload = _make_device_settings_payload(mode_num=255)
+        assert _parse_device_settings_response(payload)[DATA_BRUSH_MODE] == 255
+
+    def test_mode_num_k3_clean(self):
+        # K3 mode 0 = "Clean" (APK: cbModeClean checked when modeNum != 3)
+        payload = _make_device_settings_payload(mode_num=0)
+        assert _parse_device_settings_response(payload)[DATA_BRUSH_MODE] == 0
+
+    def test_mode_num_k3_core(self):
+        # K3 mode 3 = "Core" (APK: cbModeCore checked when modeNum == 3)
+        payload = _make_device_settings_payload(mode_num=3)
+        assert _parse_device_settings_response(payload)[DATA_BRUSH_MODE] == 3
+
+    def test_battery_from_byte0(self):
+        """0302 byte 0 = batteryLevel, reliable fallback for OCLEANA1 (#7)."""
+        payload = bytearray(_make_device_settings_payload())
+        payload[0] = 75
+        result = _parse_device_settings_response(bytes(payload))
+        assert result[DATA_BATTERY] == 75
+
+    def test_battery_out_of_range_skipped(self):
+        payload = bytearray(_make_device_settings_payload())
+        payload[0] = 128  # > 100
+        result = _parse_device_settings_response(bytes(payload))
+        assert DATA_BATTERY not in result
+
+    def test_exact_6_bytes_accepted(self):
+        payload = bytes([0x50, 0x01, 0x01, 0x01, 0x02, 0x04])
+        result = _parse_device_settings_response(payload)
+        assert result[DATA_BRUSH_MODE] == 4
+        assert result[DATA_BATTERY] == 0x50  # byte 0 = 80
+
+    def test_too_short_returns_empty(self):
+        assert _parse_device_settings_response(b"") == {}
+        assert _parse_device_settings_response(bytes(5)) == {}
+
+    def test_extra_bytes_ignored(self):
+        payload = _make_device_settings_payload(mode_num=7, extra_bytes=50)
+        assert _parse_device_settings_response(payload)[DATA_BRUSH_MODE] == 7
+
+    def test_routed_via_parse_notification(self):
+        # RESP_DEVICE_SETTINGS (0302) prefix must be registered in _PARSERS
+        mode = 5
+        payload = _make_device_settings_payload(mode_num=mode)
+        notification = RESP_DEVICE_SETTINGS + payload
+        result = parse_notification(notification)
+        assert result[DATA_BRUSH_MODE] == mode

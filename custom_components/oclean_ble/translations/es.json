@@ -1,0 +1,247 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Cepillo Oclean (no oficial)",
+        "description": "Configura tu Cepillo Oclean Inteligente. Los dispositivos cercanos se mostrarán automáticamente si el Bluetooth está activado."
+      },
+      "pick_device": {
+        "title": "Selecciona el dispositivo Oclean",
+        "description": "Selecciona el dispositivo Oclean para integrar.",
+        "data": {
+          "mac_address": "Dispositivo",
+          "poll_interval": "Intervalo de sondeo (segundos)"
+        }
+      },
+      "manual": {
+        "title": "Configuración manual",
+        "description": "No se han encontrado dispositivos Oclean cerca. Introduce la dirección MAC de tu cepillo Oclean manualmente. Puedes encontrarla en la aplicación oficial Oclean en los ajustes del dispositivo.",
+        "data": {
+          "mac_address": "Dirección MAC (ej. AA:BB:CC:DD:EE:FF)",
+          "device_name": "Nombre del dispositivo",
+          "poll_interval": "Intervalo de sondeo (segundos)"
+        },
+        "data_description": {
+          "mac_address": "La dirección MAC Bluetooth de tu cepillo Oclean.",
+          "poll_interval": "Cada cuánto (en segundos) se sondea el dispositivo. Mínimo 60 s, o 0 para desactivar el sondeo automático. Predeterminado: 300 s (5 min)."
+        }
+      },
+      "confirm": {
+        "title": "Confirmar dispositivo Oclean",
+        "description": "Se ha encontrado el dispositivo Oclean **{name}** ({mac}). Confírmalo para añadirlo.",
+        "data": {
+          "poll_interval": "Intervalo de sondeo (segundos)"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Formato de dirección MAC no válido. Usa AA:BB:CC:DD:EE:FF.",
+      "cannot_connect": "No se pudo conectar con el dispositivo. Asegúrate de que está cargado y cerca."
+    },
+    "abort": {
+      "already_configured": "Este dispositivo Oclean ya está configurado.",
+      "no_devices_found": "No se han encontrado dispositivos Oclean."
+    }
+  },
+  "entity": {
+    "image": {
+      "brush_coverage": {
+        "name": "Cobertura de cepillado"
+      },
+      "zone_heatmap": {
+        "name": "Mapa de calor de zonas"
+      }
+    },
+    "button": {
+      "reset_brush_head": {
+        "name": "Reiniciar cabezal"
+      },
+      "sync_time": {
+        "name": "Sincronizar hora"
+      },
+      "poll_now": {
+        "name": "Actualizar ahora"
+      }
+    },
+    "select": {
+      "brush_scheme": {
+        "name": "Programa de cepillado"
+      }
+    },
+    "switch": {
+      "area_remind": {
+        "name": "Recordatorio de zonas"
+      },
+      "over_pressure": {
+        "name": "Alerta de sobrepresión"
+      },
+      "remind_switch": {
+        "name": "Recordatorio de cepillado"
+      },
+      "running_switch": {
+        "name": "Apagado automático"
+      }
+    },
+    "number": {
+      "brush_head_max_days": {
+        "name": "Vida máx. del cabezal"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Batería"
+      },
+      "last_brush_score": {
+        "name": "Puntuación"
+      },
+      "last_brush_coverage": {
+        "name": "Cobertura"
+      },
+      "last_brush_duration": {
+        "name": "Duración"
+      },
+      "last_brush_pressure": {
+        "name": "Presión"
+      },
+      "last_brush_time": {
+        "name": "Última sesión"
+      },
+      "brush_head_usage": {
+        "name": "Sesiones del cabezal"
+      },
+      "brush_head_days": {
+        "name": "Edad del cabezal"
+      },
+      "brush_mode": {
+        "name": "Modo"
+      },
+      "model_id": {
+        "name": "Modelo"
+      },
+      "hw_revision": {
+        "name": "Revisión HW"
+      },
+      "sw_version": {
+        "name": "Firmware"
+      },
+      "last_poll": {
+        "name": "Última consulta"
+      },
+      "cleaned_zones": {
+        "name": "Zonas limpiadas"
+      },
+      "last_scheme": {
+        "name": "Último programa"
+      },
+      "mac_address": {
+        "name": "Dirección MAC"
+      },
+      "duration_ratio": {
+        "name": "Valoración de duración"
+      },
+      "last_brush_gesture_code": {
+        "name": "Técnica"
+      },
+      "last_brush_pressure_ratio": {
+        "name": "Detalle de presión"
+      },
+      "last_brush_power_array": {
+        "name": "Distribución de potencia"
+      },
+      "zone_upper_left_out": {
+        "name": "Zona Superior Izquierda Exterior"
+      },
+      "zone_upper_left_in": {
+        "name": "Zona Superior Izquierda Interior"
+      },
+      "zone_lower_left_out": {
+        "name": "Zona Inferior Izquierda Exterior"
+      },
+      "zone_lower_left_in": {
+        "name": "Zona Inferior Izquierda Interior"
+      },
+      "zone_upper_right_out": {
+        "name": "Zona Superior Derecha Exterior"
+      },
+      "zone_upper_right_in": {
+        "name": "Zona Superior Derecha Interior"
+      },
+      "zone_lower_right_out": {
+        "name": "Zona Inferior Derecha Exterior"
+      },
+      "zone_lower_right_in": {
+        "name": "Zona Inferior Derecha Interior"
+      },
+      "zone_upper_center_out": {
+        "name": "Zona Superior Centro Exterior"
+      },
+      "zone_upper_center_in": {
+        "name": "Zona Superior Centro Interior"
+      },
+      "zone_lower_center_out": {
+        "name": "Zona Inferior Centro Exterior"
+      },
+      "zone_lower_center_in": {
+        "name": "Zona Inferior Centro Interior"
+      },
+      "zone_history": {
+        "name": "Zona más débil",
+        "state": {
+          "upper_left_out": "Superior Izquierda Exterior",
+          "upper_left_in": "Superior Izquierda Interior",
+          "lower_left_out": "Inferior Izquierda Exterior",
+          "lower_left_in": "Inferior Izquierda Interior",
+          "upper_right_out": "Superior Derecha Exterior",
+          "upper_right_in": "Superior Derecha Interior",
+          "lower_right_out": "Inferior Derecha Exterior",
+          "lower_right_in": "Inferior Derecha Interior"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opciones de Oclean",
+        "data": {
+          "poll_interval": "Intervalo de sondeo (segundos)",
+          "post_brush_cooldown": "Tiempo de espera tras cepillado (horas)",
+          "window_count": "Número de ventanas horarias de cepillado"
+        },
+        "data_description": {
+          "poll_interval": "Con qué frecuencia sondear el cepillo por Bluetooth. Mínimo 60 s. 0 = manual (sin sondeo automático).",
+          "post_brush_cooldown": "Detener el sondeo durante estas horas tras detectar un nuevo cepillado. 0 para desactivar.",
+          "window_count": "Restringir el sondeo a ventanas horarias concretas (ej. mañana y noche). 0 para sondear siempre."
+        }
+      },
+      "window_1": {
+        "title": "Ventana de cepillado 1",
+        "description": "Define la primera ventana horaria durante la cual se sondeará el cepillo.",
+        "data": {
+          "window_start": "Desde",
+          "window_end": "Hasta"
+        }
+      },
+      "window_2": {
+        "title": "Ventana de cepillado 2",
+        "description": "Define la segunda ventana horaria durante la cual se sondeará el cepillo.",
+        "data": {
+          "window_start": "Desde",
+          "window_end": "Hasta"
+        }
+      },
+      "window_3": {
+        "title": "Ventana de cepillado 3",
+        "description": "Define la tercera ventana horaria durante la cual se sondeará el cepillo.",
+        "data": {
+          "window_start": "Desde",
+          "window_end": "Hasta"
+        }
+      }
+    },
+    "error": {
+      "window_incomplete": "Debes establecer tanto la hora de inicio como la de fin.",
+      "invalid_poll_interval": "El intervalo de sondeo debe ser 0 (manual) o al menos 60 segundos."
+    }
+  }
+}

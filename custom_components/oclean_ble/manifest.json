@@ -1,0 +1,17 @@
+{
+  "domain": "oclean_ble",
+  "name": "Oclean Toothbrush (unofficial)",
+  "after_dependencies": ["recorder"],
+  "bluetooth": [
+    {"service_uuid": "8082caa8-41a6-4021-91c6-56f9b954cc18"},
+    {"local_name": "Oclean*"}
+  ],
+  "codeowners": ["@deniskie"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/deniskie/ha-oclean-integration",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/deniskie/ha-oclean-integration/issues",
+  "requirements": [],
+  "version": "1.2.3"
+}
